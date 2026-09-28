@@ -1,7 +1,7 @@
 """Small official-response shapes for deterministic source tests."""
 
 
-def comtrade_codes(name):
+def comtrade_codes(name, *, refresh=False):
     reporters = [
         {"code": "36", "label": "Australia"},
         {"code": "554", "label": "New Zealand"},

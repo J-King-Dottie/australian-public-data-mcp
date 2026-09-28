@@ -19,8 +19,8 @@ CATALOGUE = f"""<Root {NAMESPACES}>
 METADATA = f"""<Root {NAMESPACES}>
 <s:Dataflow id="DF_TEST" agencyID="SPC" version="1.0"><c:Name>Pacific population</c:Name>
 <c:Annotations><c:Annotation><c:AnnotationType>NonProductionDataflow</c:AnnotationType><c:AnnotationText>true</c:AnnotationText></c:Annotation></c:Annotations>
-<s:Structure><Ref id="DSD_TEST"/></s:Structure></s:Dataflow>
-<s:DataStructure id="DSD_TEST"><s:DataStructureComponents><s:DimensionList>
+<s:Structure><Ref id="DSD_TEST" agencyID="SPC" version="1.0"/></s:Structure></s:Dataflow>
+<s:DataStructure id="DSD_TEST" agencyID="SPC" version="1.0"><s:DataStructureComponents><s:DimensionList>
 <s:Dimension id="INDICATOR" position="4"><s:LocalRepresentation><s:Enumeration><Ref class="Codelist" id="CL_IND" agencyID="SPC" version="1.0"/></s:Enumeration></s:LocalRepresentation></s:Dimension>
 <s:TimeDimension id="TIME_PERIOD" position="2"/>
 <s:Dimension id="GEO_PICT" position="3"><s:LocalRepresentation><s:Enumeration><Ref class="Codelist" id="CL_GEO" agencyID="SPC" version="2.0"/></s:Enumeration></s:LocalRepresentation></s:Dimension>
@@ -39,7 +39,11 @@ def codelist(code_id, codes):
     content = "".join(
         f'<s:Code id="{code}"><c:Name>{label}</c:Name></s:Code>' for code, label in codes
     )
-    return f'<Root {NAMESPACES}><s:Codelist id="{code_id}">{content}</s:Codelist></Root>'
+    agency, version = {
+        "CL_FREQ": ("OTHER", "1.1"),
+        "CL_GEO": ("SPC", "2.0"),
+    }.get(code_id, ("SPC", "1.0"))
+    return f'<Root {NAMESPACES}><s:Codelist id="{code_id}" agencyID="{agency}" version="{version}">{content}</s:Codelist></Root>'
 
 
 class PacificTests(unittest.TestCase):
@@ -113,7 +117,7 @@ class PacificTests(unittest.TestCase):
             result = server.search_catalog("population", provider="SPC", forceRefresh=True)
         self.assertEqual(result["total"], 1)
         search.assert_called_once_with(
-            "population", limit=50, offset=0, force_refresh=True, provider="SPC"
+            "population", limit=50, offset=0, force_refresh=True, provider="SPC", match="any"
         )
 
     def test_metadata_order_and_codelist_agency_pagination(self):

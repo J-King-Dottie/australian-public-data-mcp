@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 import re
-import time
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
-from threading import RLock
 from typing import Any
 
 import httpx
 
-from .selection import code_page
+from . import source_http
+from .fetch_cache import FetchCache
+from .selection import METADATA_PREVIEW_LIMIT, code_page
 
 NS = {
     "structure": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
     "common": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
 }
-METADATA_TTL = 3600
 
 
 def _text(element: ET.Element | None) -> str:
@@ -73,11 +71,10 @@ class SDMXStructureClient:
         self.timeout = timeout
         self.prefix = prefix
         self.provider = provider
-        self._lock = RLock()
-        self._xml_cache: OrderedDict[str, tuple[float, ET.Element]] = OrderedDict()
+        self._xml_cache = FetchCache(limit=64)
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
-        response = httpx.get(
+        response = source_http.get(
             f"{self.base_url}/{path}",
             params=params,
             timeout=self.timeout,
@@ -88,53 +85,110 @@ class SDMXStructureClient:
         return response
 
     def _xml(self, path: str, refresh: bool = False) -> ET.Element:
-        with self._lock:
-            cached = self._xml_cache.get(path)
-            if cached is not None and not refresh and time.monotonic() - cached[0] < METADATA_TTL:
-                self._xml_cache.move_to_end(path)
-                return cached[1]
-        try:
-            root = ET.fromstring(self._get(path, {"references": "children", "detail": "full"}).text)
-        except ET.ParseError as exc:
-            raise RuntimeError(
-                f"{self.provider} returned invalid structure XML; retry metadata later."
-            ) from exc
-        with self._lock:
-            self._xml_cache[path] = (time.monotonic(), root)
-            self._xml_cache.move_to_end(path)
-            while len(self._xml_cache) > 64:
-                self._xml_cache.popitem(last=False)
+        def load():
+            try:
+                return ET.fromstring(
+                    self._get(path, {"references": "children", "detail": "full"}).text
+                )
+            except ET.ParseError as exc:
+                raise RuntimeError(
+                    f"{self.provider} returned invalid structure XML; retry metadata later."
+                ) from exc
+
+        root, _ = self._xml_cache.get(path, load, refresh=refresh)
         return root
+
+    @staticmethod
+    def _maintainable(
+        root: ET.Element, kind: str, agency: str | None, identifier: str | None, version: str
+    ) -> ET.Element | None:
+        """Resolve one complete object; SDMX 2.1 defaults omitted versions to 1.0."""
+        matches = [
+            item
+            for item in root.findall(f".//structure:{kind}", NS)
+            if agency
+            and identifier
+            and item.get("agencyID") == agency
+            and item.get("id") == identifier
+            and (
+                item.get("version", "1.0") not in {"", "latest"}
+                and (version == "latest" or item.get("version", "1.0") == version)
+            )
+            and not any(
+                item.get(flag, "").strip().lower() in {"true", "1"}
+                for flag in ("isExternalReference", "isPartial")
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @classmethod
+    def _embedded_codelist(cls, root: ET.Element, reference: dict) -> ET.Element | None:
+        # A cached response cannot establish what "latest" currently resolves to.
+        if reference["version"] == "latest":
+            return None
+        return cls._maintainable(
+            root, "Codelist", reference["agency"], reference["id"], reference["version"]
+        )
+
+    @staticmethod
+    def _code_items(codelist: ET.Element) -> list[dict[str, Any]]:
+        return [
+            {
+                "code": item.get("id"),
+                "label": _name(item),
+                "description": _name(item, "Description"),
+            }
+            for item in codelist.findall("structure:Code", NS)
+        ]
+
+    @staticmethod
+    def _component_label(root: ET.Element, element: ET.Element) -> str:
+        ref = element.find("structure:ConceptIdentity/Ref", NS)
+        if ref is not None:
+            for scheme in root.findall(".//structure:ConceptScheme", NS):
+                if (
+                    scheme.get("id") == ref.get("maintainableParentID")
+                    and scheme.get("agencyID") == ref.get("agencyID")
+                    and scheme.get("version", "1.0") == ref.get("maintainableParentVersion", "1.0")
+                ):
+                    concept = next(
+                        (
+                            item
+                            for item in scheme.findall("structure:Concept", NS)
+                            if item.get("id") == ref.get("id")
+                        ),
+                        None,
+                    )
+                    if concept is not None and _name(concept):
+                        return _name(concept)
+        return _name(element) or element.get("id", "")
 
     def metadata(self, dataset_id: str, refresh: bool = False) -> dict[str, Any]:
         agency, flow_id, version = parse_dataset_id(dataset_id, self.prefix)
         path = f"dataflow/{agency}/{flow_id}/{version}"
         root = self._xml(path, refresh)
-        flow = next(
-            (
-                item
-                for item in root.findall(".//structure:Dataflow", NS)
-                if item.get("id") == flow_id
-            ),
-            None,
-        )
+        flow = self._maintainable(root, "Dataflow", agency, flow_id, version)
         if flow is None:
-            raise RuntimeError(f"{self.provider} metadata did not contain {flow_id}.")
+            raise RuntimeError(
+                f"{self.provider} did not return one complete dataflow "
+                f"{agency}::{flow_id}::{version}. Refresh metadata or use a current catalogue ID."
+            )
         structure_ref = flow.find("structure:Structure/Ref", NS)
-        structures = root.findall(".//structure:DataStructure", NS)
-        dsd = next(
-            (
-                item
-                for item in structures
-                if structure_ref is not None and item.get("id") == structure_ref.get("id")
-            ),
-            None,
+        dsd = (
+            self._maintainable(
+                root,
+                "DataStructure",
+                structure_ref.get("agencyID"),
+                structure_ref.get("id"),
+                structure_ref.get("version", "1.0"),
+            )
+            if structure_ref is not None
+            else None
         )
-        if dsd is None and len(structures) == 1:
-            dsd = structures[0]
         if dsd is None:
             raise RuntimeError(
-                f"{self.provider} did not return an unambiguous data structure; refusing to guess the key order."
+                f"{self.provider} did not return an unambiguous data structure matching "
+                "the referenced agency, ID and version. Refresh metadata; refusing to guess the key order."
             )
         dimensions, attributes = [], []
         for group, target, tags in (
@@ -153,20 +207,40 @@ class SDMXStructureClient:
                     ),
                     None,
                 )
+                if reference is not None and not all(
+                    reference.get(field) for field in ("id", "agencyID")
+                ):
+                    raise RuntimeError(
+                        f"{self.provider} returned an incomplete codelist reference for "
+                        f"{element.get('id')}. Refresh metadata before selecting codes."
+                    )
                 target.append(
                     {
                         "id": element.get("id"),
+                        "label": self._component_label(root, element),
                         "position": int(element.get("position", "999")),
                         "is_time": tag == "TimeDimension",
                         "codelist": {
                             "id": reference.get("id"),
-                            "agency": reference.get("agencyID", agency),
-                            "version": reference.get("version", "latest"),
+                            "agency": reference.get("agencyID"),
+                            "version": reference.get("version", "1.0"),
                         }
                         if reference is not None
                         else None,
                     }
                 )
+        for component in dimensions + attributes:
+            reference = component["codelist"]
+            embedded = self._embedded_codelist(root, reference) if reference else None
+            if embedded is not None:
+                codes = self._code_items(embedded)
+                component["code_preview"] = {
+                    "codes": codes[:METADATA_PREVIEW_LIMIT],
+                    "total_codes": len(codes),
+                    "next_offset": METADATA_PREVIEW_LIMIT
+                    if len(codes) > METADATA_PREVIEW_LIMIT
+                    else None,
+                }
         dimensions.sort(key=lambda item: item["position"])
         if not dimensions:
             raise RuntimeError(
@@ -178,7 +252,7 @@ class SDMXStructureClient:
             "provider": self.provider,
             "title": _name(flow),
             "description": _name(flow, "Description"),
-            "version": flow.get("version", version),
+            "version": flow.get("version", "1.0"),
             "dimensions": dimensions,
             "attributes": attributes,
             "annotations": _annotations(flow),
@@ -190,25 +264,20 @@ class SDMXStructureClient:
         agency, code_id, version = (
             _identifier(reference[key]) for key in ("agency", "id", "version")
         )
+        if not refresh:
+            for cached_root in reversed(self._xml_cache.values()):
+                embedded = self._embedded_codelist(cached_root, reference)
+                if embedded is not None:
+                    return self._code_items(embedded)
         root = self._xml(f"codelist/{agency}/{code_id}/{version}", refresh)
-        codelist = next(
-            (
-                item
-                for item in root.findall(".//structure:Codelist", NS)
-                if item.get("id") == code_id
-            ),
-            None,
-        )
+        codelist = self._maintainable(root, "Codelist", agency, code_id, version)
         if codelist is None:
-            raise RuntimeError(f"{self.provider} did not return codelist {code_id}.")
-        return [
-            {
-                "code": item.get("id"),
-                "label": _name(item),
-                "description": _name(item, "Description"),
-            }
-            for item in codelist.findall("structure:Code", NS)
-        ]
+            raise RuntimeError(
+                f"{self.provider} did not return one complete codelist "
+                f"{agency}::{code_id}::{version}. Refresh metadata; partial or ambiguous "
+                "code lists cannot validate selections."
+            )
+        return self._code_items(codelist)
 
     def codes(
         self,

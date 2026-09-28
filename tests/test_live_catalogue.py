@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import unicodedata
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,6 +58,80 @@ class LiveCatalogueTests(unittest.TestCase):
         catalog._invalidate_caches()
         catalog.search_unified_catalog("population")
         self.assertEqual(self.mock_fetch.call_count, len(sources.PROVIDERS))
+
+    def test_unicode_search_retains_source_words_and_equivalent_accents(self):
+        titles = ["Électricité", "Côte", "水", "Population"]
+        self.mock_fetch.side_effect = lambda provider: [
+            {**entry(provider, str(i)), "title": title, "searchText": title}
+            for i, title in enumerate(titles)
+        ]
+        for query, title in (
+            ("ÉLECTRICITÉ", "Électricité"),
+            ("electricite", "Électricité"),
+            (unicodedata.normalize("NFD", "électricité"), "Électricité"),
+            ("côte", "Côte"),
+            ("水", "水"),
+        ):
+            with self.subTest(query=query):
+                result = catalog.search_unified_catalog(query, provider="OECD")
+                self.assertEqual([row["title"] for row in result["candidates"]], [title])
+        self.assertEqual(catalog.search_unified_catalog("不存在", provider="OECD")["total"], 0)
+
+    def test_unicode_queries_keep_pagination_and_provider_scope(self):
+        self.mock_fetch.side_effect = lambda provider: [
+            {**entry(provider, str(i)), "title": f"Électricité {i}", "searchText": "électricité"}
+            for i in range(3)
+        ]
+        first = catalog.search_unified_catalog("électricité", provider="PDH", limit=2)
+        second = catalog.search_unified_catalog(
+            "électricité", provider="PDH", limit=2, offset=first["next_offset"]
+        )
+        self.assertEqual((first["total"], second["total"]), (3, 3))
+        rows = first["candidates"] + second["candidates"]
+        self.assertEqual(len({row["datasetId"] for row in rows}), 3)
+        self.assertEqual({row["provider"] for row in rows}, {"Pacific Data Hub"})
+        self.assertIsNone(second["next_offset"])
+
+    def test_query_punctuation_is_literal_and_repeated_terms_do_not_change_results(self):
+        expected = catalog.search_unified_catalog("population")
+        for query in ('"population":*()', "population population", "POPULATION"):
+            result = catalog.search_unified_catalog(query)
+            self.assertEqual(result["candidates"], expected["candidates"])
+        # The search builder never exposes caller-supplied FTS operators.
+        self.assertEqual(catalog._match_query('水" OR (côte*)'), '"水"* OR "or"* OR "côte"*')
+
+    def test_explicit_matching_modes_narrow_without_changing_provider_or_pagination(self):
+        titles = ["Total population", "Population total", "Total exports", "Population estimates"]
+        self.mock_fetch.side_effect = lambda provider: [
+            {**entry(provider, str(i)), "title": title, "searchText": title}
+            for i, title in enumerate(titles)
+        ]
+        broad = catalog.search_unified_catalog("total population", provider="OECD")
+        self.assertEqual(broad["total"], 4)
+        first = catalog.search_unified_catalog(
+            "total population", provider="OECD", match="all", limit=1
+        )
+        second = catalog.search_unified_catalog(
+            "total population", provider="OECD", match="all", limit=1, offset=first["next_offset"]
+        )
+        self.assertEqual(first["total"], 2)
+        self.assertNotEqual(first["candidates"], second["candidates"])
+        self.assertIsNone(second["next_offset"])
+        phrase = catalog.search_unified_catalog("total population", provider="OECD", match="phrase")
+        self.assertEqual([row["title"] for row in phrase["candidates"]], ["Total population"])
+        self.assertEqual(phrase["match"], "phrase")
+        absent = catalog.search_unified_catalog("population nonexistent", match="all")
+        self.assertEqual(absent["total"], 0)
+
+    def test_phrase_keeps_word_order_repetition_filler_words_and_literal_syntax(self):
+        self.assertEqual(
+            catalog._match_query('data data OR "water"', "phrase"), '"data data or water"'
+        )
+        self.assertEqual(catalog._match_query("SP.POP.TOTL", "phrase"), '"sp pop totl"')
+        self.assertEqual(catalog._match_query("Côte 水", "all"), '"côte"* AND "水"*')
+        with self.assertRaisesRegex(ValueError, "match must"):
+            catalog.search_unified_catalog("population", match="typo")
+        self.mock_fetch.assert_not_called()
 
     def test_concurrent_first_queries_only_fetch_once(self):
         with ThreadPoolExecutor(max_workers=4) as pool:

@@ -4,19 +4,17 @@ import io
 import json
 import math
 import re
-import time
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
 from datetime import UTC, datetime
 from functools import lru_cache
-from threading import RLock
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from . import energy_workbook, rba_tables
+from . import energy_workbook, rba_tables, source_http
 from .data_config import get_data_settings
+from .fetch_cache import FetchCache
 from .selection import coverage_gaps, sdmx_selection
 
 settings = get_data_settings()
@@ -82,8 +80,9 @@ class ABSApiClient:
         )
 
     def get_dataflows_xml(self, agency_id: str = "ABS") -> str:
-        response = self._client.get(
+        response = source_http.get(
             f"/rest/dataflow/{agency_id}",
+            client=self._client,
             headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"},
         )
         response.raise_for_status()
@@ -95,8 +94,9 @@ class ABSApiClient:
         structure_id: str,
         version: str,
     ) -> str:
-        response = self._client.get(
+        response = source_http.get(
             f"/rest/datastructure/{agency_id}/{structure_id}/{version}",
+            client=self._client,
             params={"references": "children", "detail": "full"},
             headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"},
         )
@@ -119,8 +119,9 @@ class ABSApiClient:
             params["endPeriod"] = end_period
         if dimension_at_observation:
             params["dimensionAtObservation"] = dimension_at_observation
-        response = self._client.get(
+        response = source_http.get(
             f"/rest/data/{dataflow_id}/{quote(data_key, safe='.+_-')}",
+            client=self._client,
             params=params,
             headers={"Accept": "application/vnd.sdmx.data+json"},
         )
@@ -141,34 +142,27 @@ class CustomDomesticService:
 
     def __init__(self, flow_type: str) -> None:
         self.flow_type = flow_type
-        self._cache = OrderedDict()
-        self._lock = RLock()
+        self._cache = FetchCache(limit=4)
 
     def supports(self, flow: dict[str, Any]) -> bool:
         return flow.get("flowType") == self.flow_type
 
     def _parsed(self, flow: dict[str, Any], force_refresh: bool):
         url = flow["sourceUrl"]
-        with self._lock:
-            cached = self._cache.get(url)
-            if cached and not force_refresh and time.monotonic() - cached[0] < 3600:
-                self._cache.move_to_end(url)
-                return cached[1], cached[2], True
-        response = httpx.get(
-            url, timeout=120, follow_redirects=True, headers={"User-Agent": "AusData-MCP/1.0"}
-        )
-        response.raise_for_status()
-        if self.flow_type == "rba_tables_csv":
-            parsed = rba_tables.parse_table(rba_tables.load_rows(response.content))
-        else:
-            parsed = energy_workbook.load_workbook(io.BytesIO(response.content))
-        with self._lock:
-            fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds")
-            self._cache[url] = (time.monotonic(), parsed, fetched_at)
-            self._cache.move_to_end(url)
-            while len(self._cache) > 4:
-                self._cache.popitem(last=False)
-        return parsed, fetched_at, False
+
+        def load():
+            response = source_http.get(
+                url, timeout=120, follow_redirects=True, headers={"User-Agent": "AusData-MCP/1.0"}
+            )
+            response.raise_for_status()
+            if self.flow_type == "rba_tables_csv":
+                parsed = rba_tables.parse_table(rba_tables.load_rows(response.content))
+            else:
+                parsed = energy_workbook.load_workbook(io.BytesIO(response.content))
+            return parsed, datetime.now(UTC).isoformat(timespec="milliseconds")
+
+        (parsed, fetched_at), reused = self._cache.get(url, load, refresh=force_refresh)
+        return parsed, fetched_at, reused
 
     def get_metadata(self, flow: dict[str, Any], force_refresh: bool = False) -> dict[str, Any]:
         parsed, fetched_at, cached = self._parsed(flow, force_refresh)
@@ -204,8 +198,7 @@ class CustomDomesticService:
 class DomesticDataService:
     def __init__(self) -> None:
         self.api_client = ABSApiClient()
-        self._structures = OrderedDict()
-        self._metadata_lock = RLock()
+        self._structures = FetchCache(limit=64)
         self.dcceew_service = CustomDomesticService("dcceew_aes_xlsx")
         self.rba_service = CustomDomesticService("rba_tables_csv")
 
@@ -234,18 +227,12 @@ class DomesticDataService:
         )
         version = _clean_text(structure.get("version")) or _clean_text(flow.get("version"))
         key = (agency_id, structure_id, version)
-        with self._metadata_lock:
-            cached = self._structures.get(key)
-            if cached and not force_refresh and time.monotonic() - cached[0] < 3600:
-                self._structures.move_to_end(key)
-                return {**cached[1], "dataflow": flow}
-        xml_text = self.api_client.get_data_structure_xml(agency_id, structure_id, version)
-        metadata = self._extract_data_structure(xml_text)
-        with self._metadata_lock:
-            self._structures[key] = (time.monotonic(), metadata)
-            self._structures.move_to_end(key)
-            while len(self._structures) > 64:
-                self._structures.popitem(last=False)
+
+        def load():
+            xml_text = self.api_client.get_data_structure_xml(agency_id, structure_id, version)
+            return self._extract_data_structure(xml_text)
+
+        metadata, _ = self._structures.get(key, load, refresh=force_refresh)
         return {**metadata, "dataflow": flow}
 
     def resolve_dataset(
@@ -383,6 +370,29 @@ class DomesticDataService:
         attributes = self._extract_attributes(data_structure_node)
         codelists = self._extract_codelists(root)
         concepts = self._extract_concepts(root)
+        # Schemes may contain hundreds of concepts for other datasets. Resolve
+        # references from the whole DSD, including time/measure/role components.
+        concept_refs = {
+            (
+                ref.get("agencyID"),
+                ref.get("maintainableParentID"),
+                ref.get("maintainableParentVersion", "1.0"),
+                ref.get("id"),
+            )
+            for ref in _iter_descendants(data_structure_node, "Ref")
+            if ref.get("maintainableParentID") and ref.get("class") in {None, "Concept"}
+        }
+        referenced_concepts = [
+            item
+            for item in concepts
+            if (
+                item["scheme"]["agencyID"],
+                item["scheme"]["id"],
+                item["scheme"]["version"],
+                item["id"],
+            )
+            in concept_refs
+        ]
         return {
             "dataStructure": {
                 "id": _clean_text(data_structure_node.attrib.get("id")),
@@ -394,7 +404,9 @@ class DomesticDataService:
             "dimensions": dimensions,
             "attributes": attributes,
             "codelists": codelists,
-            "concepts": concepts,
+            "concepts": referenced_concepts,
+            "concept_scope": "Concepts referenced by this data structure, including measures and roles.",
+            "unreferenced_concept_count": len(concepts) - len(referenced_concepts),
         }
 
     def _extract_dimensions(self, data_structure_node: ET.Element) -> list[dict[str, Any]]:
@@ -503,7 +515,7 @@ class DomesticDataService:
             scheme_info = {
                 "id": _clean_text(scheme.attrib.get("id")),
                 "agencyID": _clean_text(scheme.attrib.get("agencyID")),
-                "version": _clean_text(scheme.attrib.get("version")),
+                "version": _clean_text(scheme.attrib.get("version", "1.0")),
                 "name": _localized_text(scheme, "Name"),
             }
             for concept in _direct_children(scheme, "Concept"):

@@ -1,6 +1,7 @@
 """Data-integrity failures must be errors, never silently successful slices."""
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +9,9 @@ from unittest.mock import patch
 
 import httpx
 from fixtures import comtrade_codes
-from mcp.server.fastmcp.exceptions import ToolError
 
 from ausdata_mcp import artifacts, macro_data, runtime, server
+from ausdata_mcp.errors import tool_error_result
 
 
 def entry(provider):
@@ -48,7 +49,7 @@ class MacroValidationTests(unittest.TestCase):
             "AUS,2024-01,3,M,M,0,A\n"
         )
         reply = httpx.Response(200, request=httpx.Request("GET", "https://example.test"), text=text)
-        with patch.object(macro_data.httpx, "get", return_value=reply) as get:
+        with patch.object(macro_data.source_http, "get", return_value=reply) as get:
             result = macro_data._fetch_oecd(
                 entry("oecd"), {"agency": "OECD.TEST", "dataflow": "TEST"}, ["AUS"], 2024, 2024
             )
@@ -72,7 +73,7 @@ class MacroValidationTests(unittest.TestCase):
             )
             with (
                 self.subTest(error=error),
-                patch.object(macro_data.httpx, "get", return_value=reply),
+                patch.object(macro_data.source_http, "get", return_value=reply),
             ):
                 with self.assertRaisesRegex(RuntimeError, error):
                     macro_data._fetch_oecd(
@@ -92,7 +93,7 @@ class MacroValidationTests(unittest.TestCase):
             reply = httpx.Response(
                 200, request=httpx.Request("GET", "https://example.test"), text=text
             )
-            with patch.object(macro_data.httpx, "get", return_value=reply):
+            with patch.object(macro_data.source_http, "get", return_value=reply):
                 with self.assertRaisesRegex(
                     RuntimeError, "duplicate CSV|without country or period"
                 ):
@@ -106,13 +107,13 @@ class MacroValidationTests(unittest.TestCase):
 
     def test_imf_preserves_suppressed_source_value_and_rejects_invalid_periods(self):
         payload = {"values": {"TEST": {"AUS": {"2022": ".."}}}}
-        with patch.object(macro_data.httpx, "get", return_value=response(payload)):
+        with patch.object(macro_data.source_http, "get", return_value=response(payload)):
             result = macro_data._fetch_imf(entry("imf"), {"series_id": "TEST"}, ["AUS"], 2022, 2022)
         point = result["series"][0]["points"][0]
         self.assertIsNone(point["y"])
         self.assertEqual(point["source_row"]["value"], "..")
         payload["values"]["TEST"]["AUS"]["unknown"] = 1
-        with patch.object(macro_data.httpx, "get", return_value=response(payload)):
+        with patch.object(macro_data.source_http, "get", return_value=response(payload)):
             with self.assertRaisesRegex(RuntimeError, "valid annual period"):
                 macro_data._fetch_imf(entry("imf"), {"series_id": "TEST"}, ["AUS"], 2022, 2022)
 
@@ -147,7 +148,7 @@ class MacroValidationTests(unittest.TestCase):
             )
             with (
                 self.subTest(provider=fetch.__name__),
-                patch.object(macro_data.httpx, "get", return_value=reply),
+                patch.object(macro_data.source_http, "get", return_value=reply),
             ):
                 result = fetch(entry("test"), config, ["AUS", "NZL"], 2022, 2022)
                 self.assertEqual(result["coverage_gaps"][0]["codes"], ["NZL"])
@@ -155,7 +156,7 @@ class MacroValidationTests(unittest.TestCase):
 
     def test_invalid_scope_fails_before_network(self):
         with patch.object(
-            macro_data.httpx, "get", side_effect=AssertionError("No request expected")
+            macro_data.source_http, "get", side_effect=AssertionError("No request expected")
         ):
             for fetch in (
                 macro_data._fetch_world_bank,
@@ -182,7 +183,7 @@ class MacroValidationTests(unittest.TestCase):
         ):
             with (
                 self.subTest(replies=replies),
-                patch.object(macro_data.httpx, "get", side_effect=replies),
+                patch.object(macro_data.source_http, "get", side_effect=replies),
             ):
                 with self.assertRaisesRegex(
                     RuntimeError, "incomplete data|pagination was incomplete"
@@ -194,7 +195,9 @@ class MacroValidationTests(unittest.TestCase):
     def test_world_bank_rejects_wrong_slice_and_duplicate_points(self):
         row = {"countryiso3code": "AUS", "date": "2022", "value": 1}
         for rows in ([row, row], [row, {**row, "countryiso3code": "NZL"}]):
-            with patch.object(macro_data.httpx, "get", return_value=response([{"pages": 1}, rows])):
+            with patch.object(
+                macro_data.source_http, "get", return_value=response([{"pages": 1}, rows])
+            ):
                 with self.assertRaisesRegex(
                     RuntimeError, "duplicate observations|outside the requested"
                 ):
@@ -213,7 +216,9 @@ class MacroValidationTests(unittest.TestCase):
             }
         ]
         with patch.object(
-            macro_data.httpx, "get", return_value=response([{"pages": 1, "total": 1}, rows])
+            macro_data.source_http,
+            "get",
+            return_value=response([{"pages": 1, "total": 1}, rows]),
         ):
             result = macro_data._fetch_world_bank(
                 entry("worldbank"), {"series_id": "TEST"}, ["aus", "AUS"], 2022, 2022
@@ -229,7 +234,7 @@ class MacroValidationTests(unittest.TestCase):
             reply = httpx.Response(
                 200, request=httpx.Request("GET", "https://example.test"), text=text
             )
-            with patch.object(macro_data.httpx, "get", return_value=reply):
+            with patch.object(macro_data.source_http, "get", return_value=reply):
                 result = macro_data._fetch_oecd(
                     entry("oecd"), {"agency": "OECD.TEST", "dataflow": "TEST"}, ["AUS"], 2022, 2022
                 )
@@ -254,7 +259,9 @@ class MacroValidationTests(unittest.TestCase):
         }
         for invalid in ({"error": "failed"}, {"data": "invalid"}):
             with patch.object(
-                macro_data.httpx, "get", side_effect=[response({"data": [row]}), response(invalid)]
+                macro_data.source_http,
+                "get",
+                side_effect=[response({"data": [row]}), response(invalid)],
             ):
                 with self.assertRaisesRegex(RuntimeError, "incomplete data"):
                     macro_data._fetch_comtrade(
@@ -278,7 +285,7 @@ class MacroValidationTests(unittest.TestCase):
             "cmdCode": "TOTAL",
             "flowCode": "X",
         }
-        with patch.object(macro_data.httpx, "get", return_value=response({"data": [row]})):
+        with patch.object(macro_data.source_http, "get", return_value=response({"data": [row]})):
             with self.assertRaisesRegex(RuntimeError, "outside the requested codes"):
                 macro_data._fetch_comtrade(
                     entry("comtrade"),
@@ -352,12 +359,16 @@ class ComtradeReferenceTests(unittest.TestCase):
             start_year=2022,
             end_year=2022,
         )
-        with patch.object(macro_data.httpx, "get", return_value=response({"data": [row]})) as get:
+        with patch.object(
+            macro_data.source_http, "get", return_value=response({"data": [row]})
+        ) as get:
             macro_data._fetch_comtrade(entry("comtrade"), {}, **arguments)
         self.assertEqual(get.call_args.kwargs["params"]["motCode"], "0")
         self.assertEqual(get.call_args.kwargs["params"]["customsCode"], "C00")
         with patch.object(
-            macro_data.httpx, "get", return_value=response({"data": [{**row, "motCode": 9900}]})
+            macro_data.source_http,
+            "get",
+            return_value=response({"data": [{**row, "motCode": 9900}]}),
         ):
             with self.assertRaisesRegex(RuntimeError, "motCode outside"):
                 macro_data._fetch_comtrade(entry("comtrade"), {}, **arguments)
@@ -365,28 +376,32 @@ class ComtradeReferenceTests(unittest.TestCase):
 
 class LiveReferenceTests(unittest.TestCase):
     def setUp(self):
-        macro_data._live_comtrade_codes.cache_clear()
-        self.addCleanup(macro_data._live_comtrade_codes.cache_clear)
+        from ausdata_mcp.fetch_cache import FetchCache
+
+        cache = patch.object(macro_data, "_reference_cache", FetchCache(limit=8))
+        cache.start()
+        self.addCleanup(cache.stop)
 
     def test_live_reference_cache_refresh_and_failed_refresh_are_recoverable(self):
         first = {"results": [{"id": "090111", "text": "Coffee", "parent": "0901"}]}
         second = {"results": [{"id": "090112", "text": "Decaffeinated coffee", "parent": "0901"}]}
         with patch.object(
-            macro_data.httpx,
+            macro_data.source_http,
             "get",
             side_effect=[response(first), response({"results": []}), response(second)],
         ) as get:
             self.assertEqual(macro_data._live_comtrade_codes("HS")[0]["code"], "090111")
             macro_data._live_comtrade_codes("HS")
             self.assertEqual(get.call_count, 1)
-            macro_data._live_comtrade_codes.cache_clear()
             with self.assertRaisesRegex(RuntimeError, "no reference codes"):
-                macro_data._live_comtrade_codes("HS")
-            self.assertEqual(macro_data._live_comtrade_codes("HS")[0]["code"], "090112")
+                macro_data._live_comtrade_codes("HS", refresh=True)
+            self.assertEqual(
+                macro_data._live_comtrade_codes("HS", refresh=True)[0]["code"], "090112"
+            )
 
     def test_secondary_partner_reuses_partner_reference_request(self):
         with patch.object(
-            macro_data.httpx,
+            macro_data.source_http,
             "get",
             return_value=response({"results": [{"id": 0, "text": "World"}]}),
         ) as get:
@@ -398,7 +413,7 @@ class LiveReferenceTests(unittest.TestCase):
 
     def test_bad_reference_rows_are_not_silently_omitted(self):
         with patch.object(
-            macro_data.httpx,
+            macro_data.source_http,
             "get",
             return_value=response({"results": [{"id": 36, "text": "Australia"}, {"id": 554}]}),
         ):
@@ -510,40 +525,51 @@ class MCPArgumentTests(unittest.TestCase):
             request = httpx.Request("GET", "https://example.test/data")
             for status, headers, message in (
                 (429, {"Retry-After": "30"}, "Retry after 30 seconds"),
-                (429, {}, "Wait before retrying"),
+                (429, {}, "Retry after 1 seconds"),
                 (503, {}, "temporarily unavailable"),
                 (403, {}, "denied access"),
-                (404, {}, "Revisit search_catalog/get_metadata"),
+                (404, {}, "Verify the dataset"),
             ):
                 reply = httpx.Response(status, request=request, headers=headers)
                 error = httpx.HTTPStatusError("raw source failure", request=request, response=reply)
                 with patch.object(server, "search_unified_catalog", side_effect=error):
-                    with self.subTest(status=status), self.assertRaisesRegex(ToolError, message):
-                        await server.server.call_tool("search_catalog", {"query": "test"})
+                    with self.subTest(status=status):
+                        result = await server.server.call_tool("search_catalog", {"query": "test"})
+                        self.assertTrue(result.isError)
+                        self.assertEqual(
+                            result.structuredContent, json.loads(result.content[0].text)
+                        )
+                        self.assertIn(message, result.structuredContent["error"]["message"])
             reply = httpx.Response(404, request=request)
             error = httpx.HTTPStatusError("empty selection", request=request, response=reply)
-            guidance = server._provider_error(error, tool_name="retrieve", dataset_id="oecd::TEST")
+            guidance = tool_error_result(
+                error, "retrieve", {"datasetId": "oecd::TEST"}
+            ).structuredContent["error"]["message"]
             self.assertIn("broaden sourceFilters or dataKey", guidance)
             self.assertIn("series dimensions", guidance)
             self.assertNotIn(
                 "broaden sourceFilters",
-                server._provider_error(error, tool_name="search_catalog"),
+                tool_error_result(error, "search_catalog", {}).structuredContent["error"][
+                    "message"
+                ],
             )
             for error, message in (
-                (httpx.ReadTimeout("timeout", request=request), "timed out.*Retry once"),
+                (httpx.ReadTimeout("timeout", request=request), "timed out.*Retry later"),
                 (httpx.ConnectError("offline", request=request), "Check network availability"),
             ):
                 with patch.object(server, "search_unified_catalog", side_effect=error):
-                    with self.assertRaisesRegex(ToolError, message):
-                        await server.server.call_tool("search_catalog", {"query": "test"})
+                    result = await server.server.call_tool("search_catalog", {"query": "test"})
+                    self.assertTrue(result.isError)
+                    self.assertRegex(result.structuredContent["error"]["message"], message)
 
         asyncio.run(check())
 
     def test_declared_search_output_is_validated(self):
         async def check():
             with patch.object(server, "search_unified_catalog", return_value={"candidates": []}):
-                with self.assertRaisesRegex(ToolError, "Field required"):
-                    await server.server.call_tool("search_catalog", {"query": "test"})
+                result = await server.server.call_tool("search_catalog", {"query": "test"})
+                self.assertTrue(result.isError)
+                self.assertIn("Field required", result.structuredContent["error"]["message"])
 
         asyncio.run(check())
 
@@ -564,8 +590,10 @@ class MCPArgumentTests(unittest.TestCase):
                     ("search_catalog", {"offset": -1}),
                     ("get_metadata", {"datasetId": "ABS,TEST,1.0", "codeLimit": 201}),
                 ):
-                    with self.subTest(name=name, arguments=arguments), self.assertRaises(ToolError):
-                        await server.server.call_tool(name, arguments)
+                    with self.subTest(name=name, arguments=arguments):
+                        result = await server.server.call_tool(name, arguments)
+                        self.assertTrue(result.isError)
+                        self.assertEqual(result.structuredContent["error"]["request"], arguments)
                 lookup.assert_not_called()
                 search.assert_not_called()
             tools = {tool.name: tool for tool in await server.server.list_tools()}
@@ -598,10 +626,13 @@ class MCPArgumentTests(unittest.TestCase):
     def test_unknown_arguments_fail_before_source_access(self):
         async def check():
             with patch.object(server, "search_unified_catalog") as search:
-                with self.assertRaisesRegex(Exception, "Unknown arguments.*provder"):
-                    await server.server.call_tool(
-                        "search_catalog", {"query": "test", "provder": "ABS"}
-                    )
+                result = await server.server.call_tool(
+                    "search_catalog", {"query": "test", "provder": "ABS"}
+                )
+                self.assertTrue(result.isError)
+                self.assertRegex(
+                    result.structuredContent["error"]["message"], "Unknown arguments.*provder"
+                )
                 search.assert_not_called()
             tools = await server.server.list_tools()
             self.assertEqual(len(tools), 3)

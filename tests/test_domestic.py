@@ -116,6 +116,47 @@ class ABSDecodingTests(unittest.TestCase):
         self.assertEqual(result["attributes"][0]["relatedTo"], ["MEASURE", "GROUP"])
         self.assertEqual(result["codelists"][0]["codes"][0]["parentID"], "A")
 
+    def test_metadata_keeps_only_exact_referenced_concepts_including_measure_and_roles(self):
+        xml = """<Structure><DataStructure id="TEST"><DataStructureComponents>
+        <DimensionList><Dimension id="MEASURE" position="1"><ConceptIdentity>
+        <Ref id="MEASURE" agencyID="ABS" maintainableParentID="CS"/>
+        </ConceptIdentity><ConceptRole><Ref class="Concept" id="ROLE" agencyID="ABS"
+        maintainableParentID="CS"/></ConceptRole></Dimension>
+        <TimeDimension id="TIME_PERIOD"><ConceptIdentity><Ref id="TIME" agencyID="ABS"
+        maintainableParentID="CS"/></ConceptIdentity></TimeDimension></DimensionList>
+        <MeasureList><PrimaryMeasure id="OBS_VALUE"><ConceptIdentity><Ref id="VALUE"
+        agencyID="ABS" maintainableParentID="CS"/></ConceptIdentity></PrimaryMeasure></MeasureList>
+        <AttributeList><Attribute id="UNIT"><ConceptIdentity><Ref id="UNIT" agencyID="ABS"
+        maintainableParentID="CS"/></ConceptIdentity></Attribute></AttributeList>
+        </DataStructureComponents></DataStructure>
+        <ConceptScheme id="CS" agencyID="OTHER"><Concept id="MEASURE"><Name>Wrong agency</Name></Concept></ConceptScheme>
+        <ConceptScheme id="CS" agencyID="ABS" version="2.0"><Concept id="MEASURE"><Name>Wrong version</Name></Concept></ConceptScheme>
+        <ConceptScheme id="CS" agencyID="ABS">
+        <Concept id="MEASURE"><Name>Measure</Name><Description>Definition preserved</Description></Concept>
+        <Concept id="ROLE"/><Concept id="TIME"/><Concept id="VALUE"/><Concept id="UNIT"/>
+        <Concept id="UNUSED"/></ConceptScheme>
+        <Codelist id="CL"><Code id="A"/><Code id="B"/></Codelist></Structure>"""
+        result = self.service._extract_data_structure(xml)
+        self.assertEqual(
+            {item["id"] for item in result["concepts"]},
+            {"MEASURE", "ROLE", "TIME", "VALUE", "UNIT"},
+        )
+        self.assertEqual(result["unreferenced_concept_count"], 3)
+        self.assertEqual(result["concepts"][0]["description"], "Definition preserved")
+        self.assertEqual(len(result["codelists"][0]["codes"]), 2)
+
+    def test_unrelated_concepts_do_not_suggest_unsupported_dimensions(self):
+        xml = """<Structure><DataStructure id="TEST"><DataStructureComponents>
+        <DimensionList><Dimension id="REGION" position="1"><ConceptIdentity>
+        <Ref id="REGION" agencyID="ABS" maintainableParentID="GEOGRAPHY" maintainableParentVersion="1.0.0"/>
+        </ConceptIdentity></Dimension></DimensionList></DataStructureComponents></DataStructure>
+        <ConceptScheme id="GEOGRAPHY" agencyID="ABS" version="1.0.0">
+        <Concept id="REGION"><Name>State</Name></Concept>
+        <Concept id="POSTCODE"><Name>Postal area</Name></Concept></ConceptScheme></Structure>"""
+        result = self.service._extract_data_structure(xml)
+        self.assertEqual([item["id"] for item in result["concepts"]], ["REGION"])
+        self.assertEqual(result["unreferenced_concept_count"], 1)
+
 
 class DomesticFileTests(unittest.TestCase):
     def test_rba_preserves_missingness_and_chronological_periods(self):
@@ -144,7 +185,7 @@ class DomesticFileTests(unittest.TestCase):
     def test_custom_metadata_then_retrieval_reuses_file_and_refresh_bypasses(self):
         response = httpx.Response(200, request=httpx.Request("GET", FLOW["sourceUrl"]), content=CSV)
         service = CustomDomesticService("rba_tables_csv")
-        with patch("ausdata_mcp.domestic_data.httpx.get", return_value=response) as get:
+        with patch("ausdata_mcp.domestic_data.source_http.get", return_value=response) as get:
             metadata = service.get_metadata(FLOW)
             retrieved = service.resolve(FLOW, data_key="FTEST")
             self.assertEqual(metadata["source_fetched_at"], retrieved["source_fetched_at"])

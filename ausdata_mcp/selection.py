@@ -2,6 +2,8 @@
 
 import re
 
+METADATA_PREVIEW_LIMIT = 10
+
 
 def sdmx_selection(
     order: list[str], filters: dict | None = None, key: str = ""

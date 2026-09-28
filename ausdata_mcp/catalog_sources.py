@@ -11,6 +11,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
+from . import source_http
 from .data_config import get_data_settings
 from .domestic_data import get_domestic_service
 
@@ -61,7 +62,7 @@ class Links(HTMLParser):
 
 
 def _page(client, url):
-    response = client.get(url, timeout=60)
+    response = source_http.get(url, client=client, timeout=60)
     response.raise_for_status()
     return response.text
 
@@ -196,7 +197,7 @@ def fetch_source(provider):
             elif provider == "UN Comtrade":
                 # Comtrade is one queryable trade cube, not thousands of datasets.
                 # Validate the supported import/export operations from its live list.
-                response = client.get(COMTRADE_FLOWS, timeout=60)
+                response = source_http.get(COMTRADE_FLOWS, client=client, timeout=60)
                 response.raise_for_status()
                 flows = response.json()["results"]
                 if not {"M", "X"}.issubset({str(row["id"]) for row in flows}):
@@ -229,8 +230,9 @@ def _join_search_text(parts: list[str]) -> str:
 
 
 def fetch_world_bank_catalog(client: httpx.Client) -> list[dict[str, Any]]:
-    first = client.get(
+    first = source_http.get(
         get_data_settings().worldbank_base_url.rstrip("/") + "/indicator",
+        client=client,
         params={"format": "json", "per_page": 20000, "page": 1},
         timeout=120,
     )
@@ -244,8 +246,9 @@ def fetch_world_bank_catalog(client: httpx.Client) -> list[dict[str, Any]]:
 
     all_rows = list(rows) if isinstance(rows, list) else []
     for page in range(2, pages + 1):
-        response = client.get(
+        response = source_http.get(
             get_data_settings().worldbank_base_url.rstrip("/") + "/indicator",
+            client=client,
             params={"format": "json", "per_page": 20000, "page": page},
             timeout=120,
         )
@@ -327,7 +330,9 @@ def fetch_world_bank_catalog(client: httpx.Client) -> list[dict[str, Any]]:
 
 
 def fetch_imf_catalog(client: httpx.Client) -> list[dict[str, Any]]:
-    response = client.get(get_data_settings().imf_base_url.rstrip("/") + "/indicators", timeout=120)
+    response = source_http.get(
+        get_data_settings().imf_base_url.rstrip("/") + "/indicators", client=client, timeout=120
+    )
     response.raise_for_status()
     payload = response.json()
     indicators = payload.get("indicators") if isinstance(payload, dict) else {}
@@ -392,8 +397,11 @@ def fetch_oecd_catalog(client: httpx.Client) -> list[dict[str, Any]]:
     flows = []
     total = None
     while total is None or len(flows) < total:
-        response = client.get(
-            OECD_SEARCH, params={"tenant": "oecd", "rows": 1500, "start": len(flows)}, timeout=120
+        response = source_http.get(
+            OECD_SEARCH,
+            client=client,
+            params={"tenant": "oecd", "rows": 1500, "start": len(flows)},
+            timeout=120,
         )
         response.raise_for_status()
         payload = response.json()

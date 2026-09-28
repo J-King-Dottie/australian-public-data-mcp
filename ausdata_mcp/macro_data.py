@@ -9,9 +9,9 @@ from itertools import product
 from typing import Any
 from urllib.parse import quote
 
-import httpx
-
+from . import source_http
 from .data_config import get_data_settings
+from .fetch_cache import FetchCache
 from .sdmx_structure import SDMXStructureClient
 from .selection import coverage_gaps, sdmx_selection
 
@@ -37,37 +37,43 @@ COMTRADE_REFERENCES = {
     "TRANSPORT": "ModeOfTransportCodes",
 }
 COMTRADE_DEFAULTS = {"SECOND_PARTNER": ["0"], "CUSTOMS": ["C00"], "TRANSPORT": ["0"]}
+_reference_cache = FetchCache(limit=8)
 
 
-@lru_cache(maxsize=8)
-def _live_comtrade_codes(name: str) -> list[dict[str, Any]]:
+def _live_comtrade_codes(name: str, *, refresh: bool = False) -> list[dict[str, Any]]:
     if name == "SECOND_PARTNER":
-        return _live_comtrade_codes("PARTNER")
+        return _live_comtrade_codes("PARTNER", refresh=refresh)
     if name == "FREQUENCY":
         return [{"code": "A", "label": "Annual"}, {"code": "M", "label": "Monthly"}]
     if name not in COMTRADE_REFERENCES:
         raise ValueError("Choose a Comtrade dimension ID from get_metadata.")
-    response = httpx.get(
-        f"https://comtradeapi.un.org/files/v1/app/reference/{COMTRADE_REFERENCES[name]}.json",
-        timeout=settings.macro_timeout_seconds,
-    )
-    response.raise_for_status()
-    rows = response.json().get("results")
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"Comtrade returned no reference codes for {name}.")
-    codes = []
-    for row in rows:
-        code = row.get("id", row.get("reporterCode"))
-        label = row.get("text", row.get("reporterDesc"))
-        if code is None or not label:
-            raise RuntimeError(f"Comtrade returned an invalid {name} reference code.")
-        codes.append(
-            {
-                "code": str(code),
-                "label": str(label),
-                **({"parent": str(row["parent"])} if row.get("parent") else {}),
-            }
+    url = f"https://comtradeapi.un.org/files/v1/app/reference/{COMTRADE_REFERENCES[name]}.json"
+
+    def load():
+        response = source_http.get(
+            url,
+            timeout=settings.macro_timeout_seconds,
         )
+        response.raise_for_status()
+        rows = response.json().get("results")
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(f"Comtrade returned no reference codes for {name}.")
+        codes = []
+        for row in rows:
+            code = row.get("id", row.get("reporterCode"))
+            label = row.get("text", row.get("reporterDesc"))
+            if code is None or not label:
+                raise RuntimeError(f"Comtrade returned an invalid {name} reference code.")
+            codes.append(
+                {
+                    "code": str(code),
+                    "label": str(label),
+                    **({"parent": str(row["parent"])} if row.get("parent") else {}),
+                }
+            )
+        return codes
+
+    codes, _ = _reference_cache.get(("comtrade", url), load, refresh=refresh)
     return codes
 
 
@@ -147,40 +153,47 @@ def _build_comtrade_metadata_payload(entry: dict[str, Any]) -> dict:
     }
 
 
-@lru_cache(maxsize=2)
-def _area_codes(provider: str) -> list[dict]:
-    if provider == "worldbank":
-        response = httpx.get(
-            f"{settings.worldbank_base_url.rstrip('/')}/country",
-            params={"format": "json", "per_page": 1000},
-            timeout=settings.macro_timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if (
-            not isinstance(payload, list)
-            or len(payload) != 2
-            or not isinstance(payload[1], list)
-            or int(payload[0].get("pages", 1)) != 1
-        ):
-            raise RuntimeError("World Bank returned incomplete area metadata.")
-        return [
-            {"code": row["id"], "label": row["name"], "aliases": [row["iso2Code"]]}
-            for row in payload[1]
-        ]
-    codes = []
-    for kind in ("countries", "regions", "groups"):
-        response = httpx.get(
-            f"{settings.imf_base_url.rstrip('/')}/{kind}", timeout=settings.macro_timeout_seconds
-        )
-        response.raise_for_status()
-        values = response.json().get(kind)
-        if not isinstance(values, dict):
-            raise RuntimeError(f"IMF returned invalid {kind} metadata.")
-        codes.extend(
-            {"code": code, "label": value.get("label", code), "kind": kind}
-            for code, value in values.items()
-        )
+def _area_codes(provider: str, *, refresh: bool = False) -> list[dict]:
+    if provider not in {"worldbank", "imf"}:
+        raise ValueError("AREA browsing supports World Bank and IMF.")
+    base_url = (
+        settings.worldbank_base_url if provider == "worldbank" else settings.imf_base_url
+    ).rstrip("/")
+
+    def load():
+        if provider == "worldbank":
+            response = source_http.get(
+                f"{base_url}/country",
+                params={"format": "json", "per_page": 1000},
+                timeout=settings.macro_timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if (
+                not isinstance(payload, list)
+                or len(payload) != 2
+                or not isinstance(payload[1], list)
+                or int(payload[0].get("pages", 1)) != 1
+            ):
+                raise RuntimeError("World Bank returned incomplete area metadata.")
+            return [
+                {"code": row["id"], "label": row["name"], "aliases": [row["iso2Code"]]}
+                for row in payload[1]
+            ]
+        codes = []
+        for kind in ("countries", "regions", "groups"):
+            response = source_http.get(f"{base_url}/{kind}", timeout=settings.macro_timeout_seconds)
+            response.raise_for_status()
+            values = response.json().get(kind)
+            if not isinstance(values, dict):
+                raise RuntimeError(f"IMF returned invalid {kind} metadata.")
+            codes.extend(
+                {"code": code, "label": value.get("label", code), "kind": kind}
+                for code, value in values.items()
+            )
+        return codes
+
+    codes, _ = _reference_cache.get((provider, base_url), load, refresh=refresh)
     return codes
 
 
@@ -285,7 +298,7 @@ def _fetch_world_bank(
         params["source"] = provider_config["source_id"]
     if start_year and end_year:
         params["date"] = f"{start_year}:{end_year}"
-    response = httpx.get(url, params=params, timeout=settings.macro_timeout_seconds)
+    response = source_http.get(url, params=params, timeout=settings.macro_timeout_seconds)
     response.raise_for_status()
     if _looks_like_html_error(response.text):
         raise RuntimeError("World Bank returned an HTML error page.")
@@ -307,7 +320,9 @@ def _fetch_world_bank(
     pages = int(payload[0].get("pages", 1)) if isinstance(payload[0], dict) else 1
     for page in range(2, pages + 1):
         page_params = {**params, "page": page}
-        page_response = httpx.get(url, params=page_params, timeout=settings.macro_timeout_seconds)
+        page_response = source_http.get(
+            url, params=page_params, timeout=settings.macro_timeout_seconds
+        )
         page_response.raise_for_status()
         page_payload = page_response.json()
         if (
@@ -437,7 +452,7 @@ def _fetch_imf(
     series_id = str(provider_config.get("series_id") or "").strip()
     label = str(entry["title"] or series_id).strip()
     url = f"{settings.imf_base_url.rstrip('/')}/{series_id}"
-    response = httpx.get(url, timeout=settings.macro_timeout_seconds)
+    response = source_http.get(url, timeout=settings.macro_timeout_seconds)
     response.raise_for_status()
     payload = response.json()
     values = payload.get("values") if isinstance(payload, dict) else None
@@ -571,7 +586,7 @@ def _fetch_oecd(
         params["startPeriod"] = start
     if end:
         params["endPeriod"] = end
-    response = httpx.get(url, params=params, timeout=settings.macro_timeout_seconds)
+    response = source_http.get(url, params=params, timeout=settings.macro_timeout_seconds)
     response.raise_for_status()
     reader = csv.DictReader(io.StringIO(response.text.lstrip("\ufeff")))
     fields = reader.fieldnames or []
@@ -753,7 +768,7 @@ def _fetch_comtrade(
             "customsCode": customs,
             "motCode": transport,
         }
-        response = httpx.get(
+        response = source_http.get(
             base_url, params=params, timeout=settings.macro_timeout_seconds, headers=headers
         )
         response.raise_for_status()

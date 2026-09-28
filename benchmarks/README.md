@@ -1,11 +1,19 @@
-# Agent benchmark
+# Historical answer benchmark
 
-This benchmark tests an **agent using the AusData MCP**. Run it only when asked to run the benchmark. Updating these instructions does not start a run.
+This directory preserves the earlier eight-question answer benchmark, its reviewed
+results, and the report generator. It is historical evidence, not the active
+usable-data diagnostic. Do not append new-style trials to this incompatible schema.
 
-1. Before the first case, confirm that the agent can call `search_catalog`, `get_metadata`, and `retrieve` and can read this task's cumulative input, cached-input, and output token counters. In Codex desktop, those counters are `token_count` events in the current task's rollout JSONL under `%USERPROFILE%\.codex\sessions\`. Check the current model and reasoning level. If the MCP or measurement is unavailable, say so **before** starting case 1; do not build or edit a harness during a run.
-2. Read [cases.json](cases.json). Answer its eight questions **in order**, using the MCP for every dataset: `search_catalog` → choose a result → `get_metadata` → `retrieve` → read the complete saved JSON → answer with a source citation. Search for the dataset in each case; do not skip discovery because an identifier is known from an earlier run. Do not read [answers.json](answers.json), [results.json](results.json), or prior reports until all eight answers are recorded.
-3. For **each case**, save a raw token-counter snapshot and UTC timestamp immediately before its first search. Save another immediately after reading the retrieval and recording the answer. Record the case's elapsed wall time and the time spent in each MCP tool; add together repeated calls to the same tool. The difference between the snapshots is that case's token usage. Cached input is included in input tokens; total tokens are input plus output. Keep the eight cases sequential so their measurements do not overlap.
-4. After all eight cases, compare the recorded answers with [answers.json](answers.json) and mark each correct or incorrect. Calculate each case's estimated cost from its **measured** uncached input, cached input, and output tokens using the current documented price for the tested model. Record the pricing source and date. Sum the eight case measurements and costs; record the full run's wall time separately.
-5. Append the completed run to [results.json](results.json), including model, reasoning level, answer, dataset ID, retrieval artifact path, correctness, per-case token usage, MCP timings, elapsed time, cost, and totals. Then run `python benchmarks/build_report.py` and `python benchmarks/build_report.py --check`. Do not append a partial run or substitute estimated token counts for missing measurements.
+Regenerate historical reports with:
+python benchmarks/build_report.py
+python benchmarks/build_report.py --check
 
-The MCP's saved JSON is the evidence for each answer. The benchmark measures the agent's discovery, retrieval, and interpretation, so keep benchmark bookkeeping outside the MCP tools.
+The old runs used fixed call order, sequential shared context and answer correctness.
+Their notes document token-boundary and prior-exposure limitations. They do not
+establish a controlled improvement in time to suitable evidence.
+
+The current optional diagnostic is maintained with the local improvement process
+under .agents/improvement/BENCHMARK.md (Git-ignored, when present).
+It evaluates retrieval suitability and effort, accepts flexible call paths and
+missing telemetry, and preserves unsuccessful attempts. It introduces no benchmark
+logic into MCP tools. See the local guide for cadence and interpretation.

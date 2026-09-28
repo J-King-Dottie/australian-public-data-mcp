@@ -130,7 +130,9 @@ class MacroScopeTests(unittest.TestCase):
             rows = [{"countryiso3code": "AUS", "country": {"id": "AU"}, "date": period, "value": 2}]
             with (
                 self.subTest(period=period),
-                patch.object(macro_data.httpx, "get", return_value=response([{"pages": 1}, rows])),
+                patch.object(
+                    macro_data.source_http, "get", return_value=response([{"pages": 1}, rows])
+                ),
             ):
                 result = macro_data._fetch_world_bank(
                     entry("worldbank"), {"series_id": "TEST"}, ["AU"], 2024, 2024
@@ -144,7 +146,9 @@ class MacroScopeTests(unittest.TestCase):
             {"countryiso3code": "AUS", "date": str(year), "value": 2, "unit": unit}
             for year, unit in ((2023, "USD"), (2024, "AUD"))
         ]
-        with patch.object(macro_data.httpx, "get", return_value=response([{"pages": 1}, rows])):
+        with patch.object(
+            macro_data.source_http, "get", return_value=response([{"pages": 1}, rows])
+        ):
             result = macro_data._fetch_world_bank(
                 entry("worldbank"), {"series_id": "TEST"}, ["AUS"], 2023, 2024
             )
@@ -153,7 +157,7 @@ class MacroScopeTests(unittest.TestCase):
 
     def test_imf_accepts_area_codes_and_keeps_partial_coverage(self):
         with patch.object(
-            macro_data.httpx,
+            macro_data.source_http,
             "get",
             return_value=response({"values": {"TEST": {"EU": {"2024": 3}, "AUS": {"2023": 2}}}}),
         ):
@@ -168,7 +172,7 @@ class MacroScopeTests(unittest.TestCase):
         with (
             patch.object(macro_data, "get_oecd_service") as service,
             patch.object(
-                macro_data.httpx,
+                macro_data.source_http,
                 "get",
                 return_value=httpx.Response(
                     200, request=httpx.Request("GET", "https://example.test"), text=csv
@@ -201,7 +205,7 @@ class MacroScopeTests(unittest.TestCase):
         with (
             patch.object(macro_data, "get_oecd_service") as service,
             patch.object(
-                macro_data.httpx,
+                macro_data.source_http,
                 "get",
                 return_value=httpx.Response(
                     200, request=httpx.Request("GET", "https://example.test"), text=csv
@@ -341,7 +345,7 @@ class ComtradeScopeTests(unittest.TestCase):
                 "_live_comtrade_codes",
                 side_effect=lambda name: codes.get(name, comtrade_codes(name)),
             ),
-            patch.object(macro_data.httpx, "get", side_effect=self.reply),
+            patch.object(macro_data.source_http, "get", side_effect=self.reply),
         ):
             result = self.fetch(
                 hs_codes=["090111"],
@@ -365,13 +369,13 @@ class ComtradeScopeTests(unittest.TestCase):
                 else self.reply(url, params=params)
             )
 
-        with patch.object(macro_data.httpx, "get", side_effect=reply):
+        with patch.object(macro_data.source_http, "get", side_effect=reply):
             result = self.fetch(reporter_codes=["36", "554"])
         self.assertEqual(len(result["series"]), 1)
         self.assertIn("554/0/TOTAL", result["coverage_gaps"][0]["codes"][0])
 
     def test_large_requests_are_chunked_without_artificial_caps(self):
-        with patch.object(macro_data.httpx, "get", side_effect=self.reply) as get:
+        with patch.object(macro_data.source_http, "get", side_effect=self.reply) as get:
             result = self.fetch(frequency_code="M", start_year=1920, end_year=2024)
         self.assertEqual(get.call_count, 105)
         self.assertEqual(len(result["series"][0]["points"]), 1260)
@@ -380,7 +384,9 @@ class ComtradeScopeTests(unittest.TestCase):
     def test_public_preview_truncation_still_fails(self):
         with (
             patch.object(macro_data.settings, "comtrade_api_key", ""),
-            patch.object(macro_data.httpx, "get", return_value=response({"data": [{}] * 500})),
+            patch.object(
+                macro_data.source_http, "get", return_value=response({"data": [{}] * 500})
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "500-row"):
                 self.fetch()
@@ -389,7 +395,9 @@ class ComtradeScopeTests(unittest.TestCase):
         with (
             patch.object(macro_data, "_live_comtrade_codes", side_effect=comtrade_codes),
             patch.object(
-                macro_data.httpx, "get", side_effect=AssertionError("Data must not be requested")
+                macro_data.source_http,
+                "get",
+                side_effect=AssertionError("Data must not be requested"),
             ),
         ):
             with self.assertRaisesRegex(ValueError, "Invalid TRANSPORT"):

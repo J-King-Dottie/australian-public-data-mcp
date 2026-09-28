@@ -122,7 +122,9 @@ class ProviderTests(unittest.TestCase):
             end_year=2021,
         )
         with patch.object(
-            macro_data.httpx, "get", side_effect=AssertionError("No provider request expected")
+            macro_data.source_http,
+            "get",
+            side_effect=AssertionError("No provider request expected"),
         ) as get:
             with self.assertRaisesRegex(ValueError, "flowCode"):
                 macro_data._fetch_comtrade(entry, {}, **args)
@@ -155,7 +157,9 @@ class ProviderTests(unittest.TestCase):
             end_year=2022,
         )
         with patch.object(
-            macro_data.httpx, "get", side_effect=AssertionError("No provider request expected")
+            macro_data.source_http,
+            "get",
+            side_effect=AssertionError("No provider request expected"),
         ) as get:
             for field, invalid in (
                 ("reporter_codes", "999999"),
@@ -199,7 +203,7 @@ class ProviderTests(unittest.TestCase):
             request=httpx.Request("GET", "https://example.test/trade"),
             json={"data": [row, row]},
         )
-        with patch.object(macro_data.httpx, "get", return_value=response) as get:
+        with patch.object(macro_data.source_http, "get", return_value=response) as get:
             result = macro_data._fetch_comtrade(
                 entry,
                 {},
@@ -219,7 +223,9 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("typeCode", get.call_args.kwargs["params"])
 
         with patch.object(macro_data.settings, "comtrade_api_key", "dummy-test-key"):
-            with patch.object(macro_data.httpx, "get", return_value=response) as authenticated_get:
+            with patch.object(
+                macro_data.source_http, "get", return_value=response
+            ) as authenticated_get:
                 authenticated = macro_data._fetch_comtrade(
                     entry,
                     {},
@@ -243,7 +249,7 @@ class ProviderTests(unittest.TestCase):
             request=httpx.Request("GET", "https://example.test/trade"),
             json={"data": [row, {**row, "primaryValue": 101}]},
         )
-        with patch.object(macro_data.httpx, "get", return_value=conflicting):
+        with patch.object(macro_data.source_http, "get", return_value=conflicting):
             with self.assertRaisesRegex(RuntimeError, "conflicting values"):
                 macro_data._fetch_comtrade(
                     entry,
@@ -272,7 +278,7 @@ class ProviderTests(unittest.TestCase):
         )
         config = {"agency": "OECD.TEST", "dataflow": "TEST", "version": "1.0"}
         with (
-            patch.object(macro_data.httpx, "get", return_value=response),
+            patch.object(macro_data.source_http, "get", return_value=response),
             patch.object(macro_data, "get_oecd_service") as service,
         ):
             service.return_value.metadata.return_value = {
@@ -299,7 +305,7 @@ class ProviderTests(unittest.TestCase):
         )
         config = {"agency": "OECD.TEST", "dataflow": "TEST", "version": "1.0"}
         with (
-            patch.object(macro_data.httpx, "get", return_value=response),
+            patch.object(macro_data.source_http, "get", return_value=response),
             patch.object(macro_data, "get_oecd_service") as service,
         ):
             service.return_value.metadata.return_value = {
@@ -332,7 +338,9 @@ class ProviderTests(unittest.TestCase):
             )
 
         with patch.object(
-            macro_data.httpx, "get", side_effect=[response("2021", 1), response("2020", 2)]
+            macro_data.source_http,
+            "get",
+            side_effect=[response("2021", 1), response("2020", 2)],
         ) as get:
             result = macro_data._fetch_world_bank(
                 entry, {"series_id": "TEST", "source_id": "2"}, ["AUS"], 2020, 2021

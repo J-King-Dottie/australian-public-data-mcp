@@ -142,6 +142,10 @@ async def smoke(
                 assert all(
                     tool.inputSchema.get("additionalProperties") is False for tool in listing.tools
                 )
+                search_schema = next(
+                    tool.inputSchema for tool in listing.tools if tool.name == "search_catalog"
+                )
+                assert search_schema["properties"]["match"]["enum"] == ["any", "all", "phrase"]
                 tool_schemas = {tool.name: tool.outputSchema for tool in listing.tools}
                 assert "candidates" in tool_schemas["search_catalog"]["required"]
                 assert "artifact_path" in tool_schemas["retrieve"]["required"]
@@ -149,6 +153,14 @@ async def smoke(
                     "search_catalog", {"query": "test", "provder": "ABS"}
                 )
                 assert invalid.isError and "provder" in invalid.content[0].text
+                assert invalid.structuredContent == json.loads(invalid.content[0].text)
+                assert invalid.structuredContent["error"]["code"] == "invalid_request"
+                invalid_retrieve = await session.call_tool("retrieve", {})
+                assert invalid_retrieve.isError
+                assert invalid_retrieve.structuredContent == json.loads(
+                    invalid_retrieve.content[0].text
+                )
+                assert invalid_retrieve.structuredContent["error"]["code"] == "validation_error"
                 resources = await session.list_resources()
                 assert "ausdata://guide" in {str(item.uri) for item in resources.resources}
                 guide = await session.read_resource("ausdata://guide")
@@ -168,9 +180,15 @@ async def smoke(
 
                 found = await call(
                     "search_catalog",
-                    {"query": "NY.GDP.PCAP.CD", "provider": "World Bank", "limit": 5},
+                    {
+                        "query": "NY.GDP.PCAP.CD",
+                        "provider": "World Bank",
+                        "limit": 5,
+                        "match": "phrase",
+                    },
                 )
                 assert found["candidates"]
+                assert found["match"] == "phrase"
                 assert all("searchText" not in item for item in found["candidates"])
                 metadata = await call("get_metadata", {"datasetId": "worldbank::NY.GDP.PCAP.CD"})
                 assert metadata["source_identifiers"]["series_id"] == "NY.GDP.PCAP.CD"
@@ -178,7 +196,7 @@ async def smoke(
                     "tools": sorted(names),
                     "guidance": "verified",
                     "search": "passed",
-                    "live": "not requested",
+                    "live": "selected provider checks requested" if is_live else "not requested",
                 }
                 if is_live:
                     report["catalogue"] = found["catalogue"]
@@ -202,6 +220,22 @@ async def smoke(
                     }
                     assert sum(len(series["points"]) for series in payload["series"]) == 6
                     assert manifest["row_count"] == 6 and len(manifest["preview_rows"]) <= 3
+                    assert len(manifest["series_summaries"]) == 2
+                    assert {row["series_index"] for row in manifest["preview_rows"]} == {0, 1}
+                    if not is_live:
+                        assert manifest["non_null_value_count"] == 6
+                        assert manifest["non_null_period_end"] == "2022"
+                        failed_args = {
+                            "datasetId": "worldbank::NY.GDP.PCAP.CD",
+                            "countries": ["AUS", "NZL"],
+                            "startYear": 2010,
+                            "endYear": 2011,
+                        }
+                        failed = await session.call_tool("retrieve", failed_args)
+                        assert failed.isError
+                        assert failed.structuredContent == json.loads(failed.content[0].text)
+                        assert failed.structuredContent["error"]["http_status"] == 400
+                        assert failed.structuredContent["error"]["request"] == failed_args
                     assert (
                         manifest["artifact_bytes"] == Path(manifest["artifact_path"]).stat().st_size
                     )

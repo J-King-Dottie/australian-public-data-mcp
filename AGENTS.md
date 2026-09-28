@@ -9,7 +9,10 @@ Keep this a clean, concise data codebase. Prefer the smallest clear change that 
 ## Architecture
 
 - `ausdata_mcp/server.py`: three MCP tools, threaded dispatch, parameter validation, protocol instructions, resource and prompt.
-- `ausdata_mcp/artifacts.py`: atomic JSON evidence storage and bounded retrieval manifests.
+- `ausdata_mcp/artifacts.py`: atomic JSON evidence storage, bounded series summaries and retrieval manifests.
+- `ausdata_mcp/errors.py`: bounded, equivalent structured/text tool errors with repair guidance and failed request context.
+- `ausdata_mcp/source_http.py`: pooled HTTP connections, shared per-host GET concurrency, cooldowns and bounded transient retries.
+- `ausdata_mcp/fetch_cache.py`: bounded metadata/file/reference-list caching and concurrent identical-fetch sharing.
 - `ausdata_mcp/unified_catalog.py`: normalized session catalogue, atomic generation checks and one SQLite FTS index.
 - `ausdata_mcp/catalog_sources.py`: live source-specific discovery adapters; no dataset observations.
 - `ausdata_mcp/catalog_refresh.py`: parallel refresh, expiry, retry and source coverage status.
@@ -25,8 +28,8 @@ Keep this a clean, concise data codebase. Prefer the smallest clear change that 
 - Tool descriptions: single source of truth for call mechanics.
 - The catalogue record is the retrieval input; do not add mirrored catalogue objects or duplicate identity fields. Input annotations and search/retrieval result types define the MCP schemas. Keep structured and text results equivalent; keep source-specific metadata fields intact.
 - `.mcp.json`: optional project-local stdio configuration for clients that support this format.
-- `scripts/run_mcp.py`: absolute-path launcher independent of the client's working directory.
-- `benchmarks/`: fixed agent test questions, reviewed results and generated performance history; after each run, append to `results.json` and run `python benchmarks/build_report.py`. No benchmark logic belongs in MCP tools.
+- `ausdata_mcp/__main__.py`: canonical stdio startup; `scripts/run_mcp.py` makes it callable by absolute path from any working directory.
+- `benchmarks/`: historical answer-benchmark results and their report generator; preserve these records and regenerate with `python benchmarks/build_report.py` when historical records change. New usable-data diagnostics follow the local improvement guide when present, with separate trial records. No benchmark logic belongs in MCP tools.
 
 ## Development rules
 
@@ -36,16 +39,19 @@ Keep this a clean, concise data codebase. Prefer the smallest clear change that 
 - Keep data acquisition inside the MCP's supported pathways unless the user explicitly authorizes another route. If no suitable dataset is retrievable here, the agent should report that specific limitation and ask before seeking workbooks, websites or other APIs; do not imply the publisher has no data.
 - Do not add topic-specific report routes or duplicate analyst prompts.
 - Prefer live official-source retrieval. Discovery fetches live source lists into a disposable normalized file and FTS cache, not a checked-in catalogue or raw data mirror.
-- All providers, including Pacific, share the same session-scoped catalogue and FTS text-match order. Return up to 50 candidates by default without scores or rank labels; the agent selects suitable data after inspecting definitions and coverage. Default sessions start fresh; cache successful source lists for 24 hours, disclose stale/unavailable sources and retry failures after 60 seconds. Keep dataset metadata/codelists separate from catalogue discovery.
+- All providers, including Pacific, share the same session-scoped catalogue and FTS text-match order. Support explicit any/all/phrase matching in that same index, without silently broadening narrow searches. Return up to 50 candidates by default without scores or rank labels; the agent selects suitable data after inspecting definitions and coverage. Default sessions start fresh; cache successful source lists for 24 hours, disclose stale/unavailable sources and retry failures after 60 seconds. Keep dataset metadata/codelists separate from catalogue discovery.
 - RBA and DCCEEW routing must use live discovered download URLs. Validate file schemas; never accept an unknown layout as valid observations. Comtrade discovery is a supported-cube descriptor validated against live trade flows, not a complete indicator catalogue. Browse live reference lists; do not maintain a bundled code mirror or separate metadata ranking system.
 - Preserve PDH dimension codes, UNIT_MULT, UNIT_MEASURE, OBS_STATUS, raw suppressed values and source annotations. Metadata pagination must disclose remaining codes. Dataset IDs are namespaced as `pdh::agency::dataflow::version`.
 - Keep Australian custom sources in the domestic catalogue/retrieval flow. Align geography, period, frequency, seasonal treatment, units and definitions before comparisons.
 - Tool output must disclose truncation/pagination. Retrieval returns a bounded manifest with an absolute path to complete JSON evidence; it must never inline the full dataset, silently drop requested series or return empty data as successful evidence.
-- Keep metadata code previews bounded and remaining codes reachable through `get_metadata` pagination. Never truncate the cached source structure used to validate retrieval.
+- Scope ABS concept metadata to full agency/scheme/version/concept references from the selected data structure, including time, measures and roles; disclose omitted unrelated concepts and preserve complete codelists.
+- Keep metadata code previews bounded and remaining codes reachable through `get_metadata` pagination. Never truncate the cached source structure used to validate retrieval. Resolve OECD/Pacific dataflows, structures and codelists by agency, ID and version (SDMX 2.1 omitted versions default to 1.0); reject partial, external-only or ambiguous structures. Reuse complete embedded SDMX codelists by that same identity; previews must not trigger extra downloads.
 - Agent presentation guidance should prefer in-chat charts and answers and avoid optional PNG, CSV, Excel or report files by default. The MCP's saved retrieval JSON is working evidence, not an automatic deliverable; honor explicit user requests for export files.
 - Reject malformed or known-invalid codes, contradictory parameters, ignored filters and unverifiable/truncated source responses with repair guidance. Preserve available observations when other requested selections are absent, disclosing `coverage_gaps` in evidence and the bounded manifest. Never silently omit requested selections or substitute sources. Unit changes remain explicit on observations rather than blocking retrieval.
 - Preserve source references and retrieval timestamps in the saved data and manifest. Use unique session-scoped file paths; filtering and derived-output lineage belong to the calling agent.
 - Keep stdout exclusively for MCP protocol messages. Diagnostics and subprocess progress go to stderr.
+- Source GETs use `source_http.get`; keep retries bounded, preserve request parameters and honor provider cooldowns. Tool errors carry `isError` with equivalent structured/text `error` objects; success schemas apply to successful results.
+- Summary counts and bounds describe returned evidence. Distinguish all rows from non-null values; do not infer missing periods, comparability or quality from these summaries. Preserve observation-level dimensions and flags in the full evidence.
 - Independent requests may run concurrently. Keep shared index creation atomic. Explicit session IDs must not be shared by concurrent server processes.
 
 ## Verification

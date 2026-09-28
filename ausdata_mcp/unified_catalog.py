@@ -5,10 +5,11 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import closing
 from functools import lru_cache, wraps
 from threading import RLock
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 from .catalog_refresh import (
@@ -32,6 +33,7 @@ class SearchResult(TypedDict):
     """Public MCP discovery page and source coverage, without observations."""
 
     query: str
+    match: Literal["any", "all", "phrase"]
     total: int
     returned_count: int
     limit: int
@@ -111,11 +113,12 @@ def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-def _match_query(query: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
-    return " OR ".join(
-        f'"{token}"*' for token in tokens if len(token) > 1 and token not in STOPWORDS
-    )
+def _match_query(query: str, match: str = "any") -> str:
+    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFC", query).lower())
+    if match == "phrase":
+        return '"' + " ".join(tokens) + '"' if tokens else ""
+    operator = " AND " if match == "all" else " OR "
+    return operator.join(f'"{token}"*' for token in dict.fromkeys(tokens) if token not in STOPWORDS)
 
 
 def _invalidate_caches() -> None:
@@ -311,8 +314,16 @@ def _matching_rows(
 
 @_locked
 def search_unified_catalog(
-    query: str, limit: int = 50, *, offset: int = 0, force_refresh: bool = False, provider: str = ""
+    query: str,
+    limit: int = 50,
+    *,
+    offset: int = 0,
+    force_refresh: bool = False,
+    provider: str = "",
+    match: Literal["any", "all", "phrase"] = "any",
 ) -> SearchResult:
+    if match not in {"any", "all", "phrase"}:
+        raise ValueError("match must be any, all or phrase.")
     aliases = {
         "rba": RBA_PROVIDER,
         "dcceew": ENERGY_PROVIDER,
@@ -337,22 +348,22 @@ def search_unified_catalog(
         if status["status"] != "fresh" and (not provider or name == provider)
     ]
     clean_query = _clean_text(query)
-    clean_limit, clean_offset = limit, offset
     connection = sqlite3.connect(FTS_DB_PATH)
     connection.row_factory = sqlite3.Row
     try:
-        match_query = _match_query(clean_query)
+        match_query = _match_query(clean_query, match)
         matching_count = _matching_count(connection, match_query, provider)
-        rows = _matching_rows(connection, match_query, provider, clean_limit, clean_offset)
+        rows = _matching_rows(connection, match_query, provider, limit, offset)
         entries = [_row_to_entry(row) for row in rows]
         return {
             "query": clean_query,
+            "match": match,
             "total": matching_count,
             "returned_count": len(entries),
-            "limit": clean_limit,
-            "offset": clean_offset,
-            "next_offset": clean_offset + len(entries)
-            if clean_offset + len(entries) < matching_count
+            "limit": limit,
+            "offset": offset,
+            "next_offset": offset + len(entries)
+            if offset + len(entries) < matching_count
             else None,
             "provider": provider or None,
             "ordering": "FTS text-match order; no dataset suitability score",

@@ -11,6 +11,24 @@ from uuid import uuid4
 from .runtime import RUNTIME_DIR, SESSION_ID
 
 LARGE_ARTIFACT_BYTES = 50 * 1024 * 1024
+SERIES_SUMMARY_LIMIT = 20
+
+
+class SeriesSummary(TypedDict):
+    series_index: int
+    series_key: str | None
+    dimension_codes: dict[str, str]
+    row_count: int
+    non_null_value_count: int
+    missing_value_count: int
+    period_start: str | None
+    period_end: str | None
+    non_null_period_start: str | None
+    non_null_period_end: str | None
+    unit_examples: list[str]
+    frequency_examples: list[str]
+    unit_multiplier_codes: list[str]
+    truncated: bool
 
 
 class RetrievalManifest(TypedDict):
@@ -29,6 +47,10 @@ class RetrievalManifest(TypedDict):
     series_count: int
     row_count: int
     missing_value_count: int
+    non_null_value_count: int
+    non_null_period_start: str | None
+    non_null_period_end: str | None
+    series_summaries: list[SeriesSummary]
     warnings: list[str]
     coverage_status: Literal["returned", "partial"]
     coverage_gaps: list[dict[str, Any]]
@@ -81,6 +103,9 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
 
     series_items = payload.get("series") if isinstance(payload.get("series"), list) else []
     period_start = period_end = None
+    non_null_period_start = non_null_period_end = None
+    series_summaries: list[SeriesSummary] = []
+    preview_groups: list[list[dict[str, Any]]] = []
     dimensions: set[str] = set()
     attributes: set[str] = set()
     units: set[str] = set()
@@ -90,7 +115,7 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
     row_count = missing_count = 0
     preview_dimensions_truncated = False
 
-    for series in series_items:
+    for series_index, series in enumerate(series_items):
         if not isinstance(series, dict):
             raise RuntimeError("Source returned an invalid series; evidence was not saved.")
         series_dimensions = series.get("dimensions") or {}
@@ -110,7 +135,15 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
             raise RuntimeError(
                 "Source returned a series without observations; evidence was not saved."
             )
-        for record in records:
+        series_missing = 0
+        series_start = series_end = None
+        value_start = value_end = None
+        series_units: set[str] = set()
+        series_frequencies: set[str] = set()
+        series_multipliers: set[str] = set()
+        samples: list[dict[str, Any]] = []
+        sample_indices = {0, (len(records) - 1) // 2, len(records) - 1}
+        for record_index, record in enumerate(records):
             if not isinstance(record, dict):
                 raise RuntimeError(
                     "Source returned an invalid observation; evidence was not saved."
@@ -139,17 +172,35 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
             period_end = max(period_end, period) if period_end else period
             value = record.get("y") if is_macro else record.get("value")
             missing_count += value is None
+            series_missing += value is None
+            series_start = min(series_start, period) if series_start else period
+            series_end = max(series_end, period) if series_end else period
+            if value is not None:
+                value_start = min(value_start, period) if value_start else period
+                value_end = max(value_end, period) if value_end else period
+                non_null_period_start = (
+                    min(non_null_period_start, period) if non_null_period_start else period
+                )
+                non_null_period_end = (
+                    max(non_null_period_end, period) if non_null_period_end else period
+                )
+            collect_sample = series_index < 3 and record_index in sample_indices
             if is_macro:
-                units.add(_clean_text(record.get("unit")))
+                unit = _clean_text(record.get("unit", series.get("unit")))
+                units.add(unit)
+                series_units.add(unit)
+                series_frequencies.add(_clean_text(series.get("frequency")))
                 source_row = record.get("source_row") or {}
                 for key in ("UNIT_MULT", "OBS_STATUS", "OBS_CONF"):
                     if key in source_row:
                         attributes.add(key)
                 if _clean_text(source_row.get("UNIT_MULT")):
                     unit_multipliers.add(_clean_text(source_row["UNIT_MULT"]))
-                if len(preview) < 3:
-                    preview.append(
+                    series_multipliers.add(_clean_text(source_row["UNIT_MULT"]))
+                if collect_sample:
+                    samples.append(
                         {
+                            "series_index": series_index,
                             "country_code": series.get("country_code"),
                             "series_id": series.get("series_id"),
                             "period": period,
@@ -175,6 +226,7 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
                     frequency = frequency.get("code") or frequency.get("label")
                 if frequency:
                     frequencies.add(str(frequency))
+                    series_frequencies.add(str(frequency))
             for key in ("UNIT", "UNIT_MEASURE", "Unit of measure"):
                 unit = record_attributes.get(key, series_attributes.get(key))
                 unit = unit or record_dimensions.get(key, series_dimensions.get(key))
@@ -182,19 +234,22 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
                     unit = unit.get("label") or unit.get("code")
                 if _clean_text(unit):
                     units.add(_clean_text(unit))
+                    series_units.add(_clean_text(unit))
             multiplier = record_attributes.get("UNIT_MULT", series_attributes.get("UNIT_MULT"))
             if isinstance(multiplier, dict):
                 multiplier = multiplier.get("code", multiplier.get("label"))
             if _clean_text(multiplier):
                 unit_multipliers.add(_clean_text(multiplier))
-            if len(preview) < 3:
+                series_multipliers.add(_clean_text(multiplier))
+            if collect_sample:
                 preview_dimensions = {**series_dimensions, **record_dimensions}
                 preview_dimensions_truncated |= len(preview_dimensions) > 12 or any(
                     len(str(item.get("code") if isinstance(item, dict) else item)) > 80
                     for item in preview_dimensions.values()
                 )
-                preview.append(
+                samples.append(
                     {
+                        "series_index": series_index,
                         "series_key": series.get("seriesKey"),
                         "period": period,
                         "value": value,
@@ -204,6 +259,55 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
                         },
                     }
                 )
+
+        if samples:
+            preview_groups.append(samples)
+        if series_index < SERIES_SUMMARY_LIMIT:
+            identity = dict(series_dimensions)
+            if is_macro and not identity:
+                identity = {
+                    key: series[key]
+                    for key in ("country_code", "series_id")
+                    if series.get(key) is not None
+                }
+            codes = {
+                key: str(item.get("code") if isinstance(item, dict) else item)
+                for key, item in identity.items()
+            }
+            key = series.get("series_key" if is_macro else "seriesKey")
+            sets = [series_units - {""}, series_frequencies - {""}, series_multipliers - {""}]
+            truncated = (
+                len(codes) > 12
+                or any(len(value) > 80 for value in codes.values())
+                or (key is not None and len(str(key)) > 256)
+                or any(len(items) > 10 or any(len(v) > 160 for v in items) for items in sets)
+            )
+            series_summaries.append(
+                {
+                    "series_index": series_index,
+                    "series_key": str(key)[:256] if key is not None else None,
+                    "dimension_codes": {k: v[:80] for k, v in list(codes.items())[:12]},
+                    "row_count": len(records),
+                    "non_null_value_count": len(records) - series_missing,
+                    "missing_value_count": series_missing,
+                    "period_start": series_start,
+                    "period_end": series_end,
+                    "non_null_period_start": value_start,
+                    "non_null_period_end": value_end,
+                    "unit_examples": [v[:160] for v in sorted(sets[0])[:10]],
+                    "frequency_examples": [v[:160] for v in sorted(sets[1])[:10]],
+                    "unit_multiplier_codes": [v[:160] for v in sorted(sets[2])[:10]],
+                    "truncated": truncated,
+                }
+            )
+
+    # Round-robin across series before taking another observation from one series.
+    preview = [
+        group[position]
+        for position in range(3)
+        for group in preview_groups
+        if position < len(group)
+    ][:3]
 
     if not row_count:
         raise RuntimeError("Source returned no observations; evidence was not saved.")
@@ -260,6 +364,10 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
         "series_count": len(series_items),
         "row_count": row_count,
         "missing_value_count": missing_count,
+        "non_null_value_count": row_count - missing_count,
+        "non_null_period_start": non_null_period_start,
+        "non_null_period_end": non_null_period_end,
+        "series_summaries": series_summaries,
         "warnings": warnings,
         "coverage_status": "partial" if gaps else "returned",
         "coverage_gaps": [{**gap, "codes": gap["codes"][:20]} for gap in gaps[:10]],
@@ -276,6 +384,7 @@ def store_retrieval(payload: dict[str, Any], dataset_id: str, label: str) -> Ret
         "preview_rows": preview,
         "preview_truncated": row_count > len(preview),
         "summary_truncated": {
+            "series_summaries": len(series_items) > SERIES_SUMMARY_LIMIT,
             "coverage_gaps": len(gaps) > 10 or any(len(gap["codes"]) > 20 for gap in gaps),
             "unit_examples": len(units - {""}) > 10,
             "frequency_examples": len(frequencies - {""}) > 10,

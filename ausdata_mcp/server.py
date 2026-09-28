@@ -8,14 +8,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .artifacts import RetrievalManifest, store_retrieval
 from .domestic_data import get_domestic_service
+from .errors import tool_error_result
 from .macro_data import (
     _area_codes,
     _build_comtrade_metadata_payload,
@@ -29,7 +28,7 @@ from .macro_data import (
 )
 from .pacific_data import get_pacific_service
 from .runtime import SESSION_ID
-from .selection import code_page, sdmx_selection
+from .selection import METADATA_PREVIEW_LIMIT, code_page, sdmx_selection
 from .unified_catalog import (
     SearchResult,
     get_unified_catalog_entry,
@@ -45,7 +44,6 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-METADATA_PREVIEW_LIMIT = 10
 
 
 def _mcp_instructions() -> str:
@@ -271,7 +269,7 @@ def _validate_retrieval_parameters(dataset_id: str, arguments: dict[str, Any]) -
 
 
 class PublicDataMCP(FastMCP):
-    """Reject misspelled arguments before the SDK discards unknown fields."""
+    """Validate unknown arguments and expose consistent tool execution errors."""
 
     async def list_tools(self):
         tools = await super().list_tools()
@@ -280,13 +278,21 @@ class PublicDataMCP(FastMCP):
         return tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
-        for tool in await self.list_tools():
-            if tool.name == name:
-                unknown = arguments.keys() - tool.inputSchema.get("properties", {}).keys()
-                if unknown:
-                    raise ToolError(f"Unknown arguments for {name}: {', '.join(sorted(unknown))}.")
-                break
-        return await super().call_tool(name, arguments)
+        try:
+            for tool in await self.list_tools():
+                if tool.name == name:
+                    unknown = arguments.keys() - tool.inputSchema.get("properties", {}).keys()
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown arguments for {name}: {', '.join(sorted(unknown))}."
+                        )
+                    break
+            else:
+                raise ValueError(f"Unknown tool: {name}. Use tools/list to discover tools.")
+            return await super().call_tool(name, arguments)
+        except Exception as exc:
+            # Error results are returned outside success-output validation.
+            return tool_error_result(exc, name, arguments)
 
 
 server = PublicDataMCP(
@@ -308,45 +314,6 @@ def analyse_public_data(question: str) -> str:
     return f"{_mcp_instructions()}\n\nUser question:\n{question}"
 
 
-def _provider_error(
-    exc: httpx.RequestError | httpx.HTTPStatusError,
-    *,
-    tool_name: str = "",
-    dataset_id: str = "",
-) -> str:
-    host = exc.request.url.host
-    if isinstance(exc, httpx.TimeoutException):
-        return (
-            f"{host} timed out. Retry once or narrow the requested scope; no result was returned."
-        )
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return f"Could not reach {host}. Check network availability and retry once."
-    status = exc.response.status_code
-    if status == 429:
-        delay = exc.response.headers.get("Retry-After", "")
-        advice = f"Retry after {delay} seconds." if delay.isdigit() else "Wait before retrying."
-        return f"{host} rate limit (HTTP 429). {advice} Reduce concurrent source requests."
-    if status >= 500:
-        advice = "Provider temporarily unavailable; retry once later."
-    elif status in (401, 403):
-        advice = "Provider denied access. Check source access requirements; do not repeat unchanged requests."
-    elif (
-        status == 404
-        and tool_name == "retrieve"
-        and dataset_id.startswith(("ABS,", "oecd::", "pdh::"))
-    ):
-        advice = (
-            "This exact SDMX selection may have no observations, even if its codes are valid. "
-            "Verify the dataset and period; broaden sourceFilters or dataKey to inspect returned "
-            "series dimensions before narrowing again."
-        )
-    else:
-        advice = (
-            "Revisit search_catalog/get_metadata and verify the dataset, codes and period coverage."
-        )
-    return f"{host} returned HTTP {status}. {advice}"
-
-
 def _threaded_tool(**options):
     """Keep blocking provider I/O off the MCP event loop, preserving tool schemas."""
 
@@ -364,14 +331,6 @@ def _threaded_tool(**options):
                     function.__name__,
                     str(exc)[:500],
                 )
-                if isinstance(exc, httpx.RequestError | httpx.HTTPStatusError):
-                    raise ToolError(
-                        _provider_error(
-                            exc,
-                            tool_name=function.__name__,
-                            dataset_id=str(arguments.get("datasetId") or ""),
-                        )
-                    ) from exc
                 raise
             logger.info(
                 "session=%s tool=%s event=success duration_ms=%s summary=%s",
@@ -409,18 +368,34 @@ def search_catalog(
         ),
     ] = "",
     offset: Annotated[int, Field(ge=0, strict=True)] = 0,
+    match: Annotated[
+        Literal["any", "all", "phrase"],
+        Field(
+            description="any matches any term; all requires every searchable term; phrase requires adjacent words in order. Empty query browses."
+        ),
+    ] = "any",
 ) -> SearchResult:
     """Find datasets in the shared live catalogue; returns candidates, not observations.
+    Query terms preserve Unicode letters and numbers, including accented names.
 
     Use concise subject/source terms. Results follow FTS text-match order, not
     suitability ranking; select candidates by definitions and coverage, then call
-    get_metadata. Follow next_offset with the same query and provider.
+    get_metadata. Use match=all to narrow broad results, or phrase for an ordered
+    phrase or identifier. No raw FTS operators; punctuation separates words.
+    any/all use word prefixes and omit common filler words; phrase keeps every word.
+    A zero-result narrowed search is not automatically broadened. Follow next_offset
+    with the same query, match and provider.
     The first call discovers all sources concurrently; allow time for a cold fetch.
     Successful catalogues are cached per session for 24 hours. catalogue.sources and
     warnings disclose stale/unavailable coverage; failed sources retry after 60 seconds.
     """
     return search_unified_catalog(
-        query, limit=limit, offset=offset, force_refresh=forceRefresh, provider=provider
+        query,
+        limit=limit,
+        offset=offset,
+        force_refresh=forceRefresh,
+        provider=provider,
+        match=match,
     )
 
 
@@ -437,7 +412,7 @@ def get_metadata(
     forceRefresh: Annotated[
         bool,
         Field(
-            description="Refresh source metadata/files; refresh macro catalogue definitions with search_catalog."
+            description="Refresh the requested source metadata/file or code list; refresh macro catalogue definitions with search_catalog."
         ),
     ] = False,
     dimension: Annotated[
@@ -457,8 +432,9 @@ def get_metadata(
 ) -> dict[str, Any]:
     """Inspect a selected dataset's definitions and valid retrieval codes.
 
-    ABS, RBA and DCCEEW preview 10 codes per codelist. PDH and OECD return structure
-    and codelist references. Reuse codes already shown; browse only missing codes
+    ABS, RBA and DCCEEW preview 10 codes per codelist. PDH and OECD return structure,
+    labels and codelist references, plus 10-code previews when complete lists are
+    embedded in the source response. Reuse codes already shown; browse only missing codes
     and follow next_offset with the same dimension/codeSearch. Search with code or
     label fragments; use the returned source code verbatim in retrieval, not the label
     or normalized search text. Similar matches remain separate choices. Codelists
@@ -468,6 +444,8 @@ def get_metadata(
     Metadata does not establish observation coverage. Browse Comtrade REPORTER,
     PARTNER and HS dimensions with codeSearch to find official country/product codes.
     Metadata always identifies dataset_id; source-specific structure is preserved.
+    ABS concepts cover actual data-structure references; concept_scope and
+    unreferenced_concept_count disclose removal of unrelated scheme members.
     """
     datasetId = datasetId.strip()
     if codeOffset < 0 or not 1 <= codeLimit <= 200:
@@ -475,8 +453,6 @@ def get_metadata(
     if not dimension and (codeSearch or codeOffset or codeLimit != 50):
         raise ValueError("Set dimension when browsing codelist codes.")
     entry = _route_entry(datasetId)
-    if forceRefresh and datasetId.startswith("comtrade::"):
-        _live_comtrade_codes.cache_clear()
     if datasetId.startswith(("pdh::", "oecd::")):
         service = get_pacific_service() if datasetId.startswith("pdh::") else get_oecd_service()
         result = (
@@ -486,12 +462,15 @@ def get_metadata(
         )
     elif datasetId.startswith("comtrade::") and dimension:
         result = code_page(
-            datasetId, dimension, _live_comtrade_codes(dimension), codeSearch, codeOffset, codeLimit
+            datasetId,
+            dimension,
+            _live_comtrade_codes(dimension, refresh=forceRefresh),
+            codeSearch,
+            codeOffset,
+            codeLimit,
         )
     elif datasetId.startswith(("worldbank::", "imf::")) and dimension == "AREA":
-        if forceRefresh:
-            _area_codes.cache_clear()
-        codes = _area_codes(entry["providerKey"])
+        codes = _area_codes(entry["providerKey"], refresh=forceRefresh)
         result = code_page(datasetId, dimension, codes, codeSearch, codeOffset, codeLimit)
     elif datasetId.startswith(("ABS,", "CUSTOM_AUS,")):
         payload = get_domestic_service().get_data_structure_for_dataflow(datasetId, forceRefresh)
@@ -601,8 +580,10 @@ def retrieve(
     disclosed in coverage_gaps while available observations are saved. Invalid or
     ignored filters, malformed/truncated responses and wholly empty results are errors.
     Returns a bounded manifest with artifact_path, record_path, counts, coverage,
-    missingness, provenance and three preview rows. Read the complete saved JSON
-    with your own code; the preview is not the evidence base. The agent needs access
+    provenance, up to 20 series_summaries and three previews sampled across series.
+    series_index addresses the saved series array. period_start/end describe returned
+    rows; non_null_period_start/end exclude null values. Neither proves completeness.
+    Read the complete saved JSON with your own code; the preview is not the evidence base. The agent needs access
     to the server's filesystem. UNIT_MULT is preserved, not applied. large_artifact
     flags files of at least 50 MiB. Individual source requests default to 120 seconds;
     paginated retrievals can take longer.
@@ -675,10 +656,3 @@ def retrieve(
         key: value for key, value in arguments.items() if value not in (None, "", False, [])
     }
     return store_retrieval(result, datasetId, entry.get("title", datasetId))
-
-
-if __name__ == "__main__":
-    from .runtime import validate_local_runtime
-
-    validate_local_runtime()
-    server.run()
