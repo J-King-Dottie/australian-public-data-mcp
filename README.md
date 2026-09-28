@@ -101,6 +101,8 @@ On launch, the MCP checks its local configuration, SQLite FTS5 support and write
 
 ## Development
 
+Run MCP verification locally using the commands below. GitHub Actions is used only for daily traffic collection.
+
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v

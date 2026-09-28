@@ -56,6 +56,8 @@ Keep this a clean, concise data codebase. Prefer the smallest clear change that 
 
 ## Verification
 
+- Run MCP checks locally. Preserve the existing daily GitHub traffic collection workflow; do not add hosted verification or other repository automation unless the user explicitly requests it.
+
 - Run `python -m unittest discover -s tests -v` and `python -m compileall -q ausdata_mcp scripts`.
 - Check the real stdio MCP path from a different working directory, without model credentials or app packages.
 - Run `ruff check ausdata_mcp scripts tests` and `ruff format --check ausdata_mcp scripts tests` with `requirements-dev.txt` installed.
