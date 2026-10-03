@@ -63,7 +63,7 @@ def _domestic_metadata_page(
     limit: int,
 ) -> dict[str, Any]:
     """Bound code previews without mutating the complete cached structure."""
-    codelists = {item["id"]: item for item in metadata.get("codelists", [])}
+    codelists = metadata.get("codelists", [])
     if dimension:
         component = next(
             (
@@ -73,9 +73,22 @@ def _domestic_metadata_page(
             ),
             None,
         )
-        codelist_id = (component.get("codelist") or {}).get("id") if component else None
-        if codelist_id not in codelists:
+        reference = (component.get("codelist") or {}) if component else {}
+        if not reference.get("id"):
             raise ValueError("Choose a dimension or attribute with a codelist from get_metadata.")
+        matches = [
+            item
+            for item in codelists
+            if item["id"] == reference["id"]
+            and (item.get("agencyID") or "") == (reference.get("agencyID") or "")
+            # SDMX 2.1 defaults omitted versions to 1.0.
+            and (item.get("version") or "1.0") == (reference.get("version") or "1.0")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Source did not provide one matching codelist for {dimension}. "
+                "Refresh metadata before browsing codes."
+            )
         codes = [
             {
                 "code": item["id"],
@@ -83,7 +96,7 @@ def _domestic_metadata_page(
                 "description": item.get("description", ""),
                 "parent_code": item.get("parentID"),
             }
-            for item in codelists[codelist_id].get("codes", [])
+            for item in matches[0].get("codes", [])
         ]
         return code_page(
             dataset_id, dimension, codes, search, offset, limit, codelist=component["codelist"]
@@ -99,7 +112,7 @@ def _domestic_metadata_page(
                 if len(item.get("codes", [])) > METADATA_PREVIEW_LIMIT
                 else None,
             }
-            for item in codelists.values()
+            for item in codelists
         ],
     }
     return {

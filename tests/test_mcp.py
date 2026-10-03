@@ -409,6 +409,58 @@ class MetadataPagingTests(unittest.TestCase):
             ],
         }
 
+    def test_domestic_codelist_pages_match_agency_and_version(self):
+        reference = {"id": "REGIONS", "agencyID": "ABS", "version": "1.0"}
+        self.metadata["dimensions"][1]["codelist"] = reference
+        self.metadata["attributes"] = [{"id": "AREA", "codelist": reference}]
+        self.metadata["codelists"][1].update(reference)
+        for agency, version in (("OTHER", "1.0"), ("ABS", "2.0")):
+            self.metadata["codelists"].append(
+                {
+                    "id": "REGIONS",
+                    "agencyID": agency,
+                    "version": version,
+                    "codes": [{"id": "WRONG", "name": "Different codelist"}],
+                }
+            )
+        original = deepcopy(self.metadata)
+        for dimension in ("REGION", "AREA"):
+            with self.subTest(dimension=dimension):
+                page = api._domestic_metadata_page(
+                    "ABS,TEST,1.0", self.metadata, dimension, "", 0, 50
+                )
+                self.assertEqual([item["code"] for item in page["codes"]], ["AUS"])
+                self.assertEqual(page["codelist"], reference)
+        preview = api._domestic_metadata_page("ABS,TEST,1.0", self.metadata, "", "", 0, 50)
+        self.assertEqual(len(preview["codelists"]), 4)
+        self.assertEqual(self.metadata, original)
+
+    def test_domestic_codelist_omitted_versions_default_to_one(self):
+        reference = self.metadata["dimensions"][1]["codelist"]
+        codelist = self.metadata["codelists"][1]
+        for reference_version, codelist_version in (("", "1.0"), ("1.0", "")):
+            with self.subTest(reference=reference_version, codelist=codelist_version):
+                reference["version"] = reference_version
+                codelist["version"] = codelist_version
+                page = api._domestic_metadata_page(
+                    "ABS,TEST,1.0", self.metadata, "REGION", "", 0, 50
+                )
+                self.assertEqual([item["code"] for item in page["codes"]], ["AUS"])
+
+    def test_domestic_codelist_missing_identity_match_is_rejected(self):
+        reference = self.metadata["dimensions"][1]["codelist"]
+        reference.update(agencyID="ABS", version="1.0")
+        for agency, version in (("OTHER", "1.0"), ("ABS", "2.0")):
+            with self.subTest(agency=agency, version=version):
+                self.metadata["codelists"][1].update(agencyID=agency, version=version)
+                with self.assertRaisesRegex(ValueError, "one matching codelist"):
+                    api._domestic_metadata_page("ABS,TEST,1.0", self.metadata, "REGION", "", 0, 50)
+
+    def test_domestic_codelist_ambiguous_identity_is_rejected(self):
+        self.metadata["codelists"].append(deepcopy(self.metadata["codelists"][1]))
+        with self.assertRaisesRegex(ValueError, "one matching codelist"):
+            api._domestic_metadata_page("ABS,TEST,1.0", self.metadata, "REGION", "", 0, 50)
+
     def test_abs_exact_key_or_full_scope_skips_metadata(self):
         with (
             patch.object(api, "_route_entry", return_value={"provider": "ABS"}),
